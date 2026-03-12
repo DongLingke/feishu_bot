@@ -24,7 +24,7 @@ while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
 
     duplicate="0"
-    for existing_pid in "${PIDS[@]}"; do
+    for existing_pid in "${PIDS[@]-}"; do
         if [[ "$existing_pid" == "$pid" ]]; then
             duplicate="1"
             break
@@ -38,11 +38,11 @@ done < <(pgrep -f "$PROJECT_DIR/main.py" || true)
 
 if [[ "${#PIDS[@]}" -gt 0 ]]; then
     echo "stopping existing process: ${PIDS[*]}"
-    kill "${PIDS[@]}" 2>/dev/null || true
+    kill "${PIDS[@]-}" 2>/dev/null || true
 
     for _ in {1..10}; do
         still_running="0"
-        for pid in "${PIDS[@]}"; do
+        for pid in "${PIDS[@]-}"; do
             if kill -0 "$pid" 2>/dev/null; then
                 still_running="1"
                 break
@@ -55,7 +55,7 @@ if [[ "${#PIDS[@]}" -gt 0 ]]; then
         sleep 1
     done
 
-    for pid in "${PIDS[@]}"; do
+    for pid in "${PIDS[@]-}"; do
         if kill -0 "$pid" 2>/dev/null; then
             echo "force killing process: $pid"
             kill -9 "$pid" 2>/dev/null || true
