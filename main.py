@@ -395,6 +395,10 @@ def _json_text_message(text: str) -> str:
     return json.dumps({"text": _trim_message_text(text)}, ensure_ascii=False)
 
 
+def _message_reply_uuid(message_id: str) -> str:
+    return f"{message_id}-reply"
+
+
 def _json_lark_md_card_message(text: str) -> str:
     return _json_final_card_data(text)
 
@@ -914,6 +918,7 @@ def _extract_stream_text(event_name: str, event: dict[str, Any]) -> tuple[str, b
 
 def _reply_text(message: Any, text: str, uuid_suffix: str) -> str:
     content = _json_text_message(text)
+    reply_uuid = _message_reply_uuid(message.message_id or "")
 
     def _reply() -> str:
         response = client.im.v1.message.reply(
@@ -924,7 +929,7 @@ def _reply_text(message: Any, text: str, uuid_suffix: str) -> str:
                 .content(content)
                 .msg_type(FEISHU_TEXT_MESSAGE_TYPE)
                 .reply_in_thread(FEISHU_REPLY_IN_THREAD)
-                .uuid(f"{message.message_id}-{uuid_suffix}")
+                .uuid(reply_uuid)
                 .build()
             )
             .build()
@@ -946,7 +951,7 @@ def _reply_text(message: Any, text: str, uuid_suffix: str) -> str:
                 .receive_id(message.chat_id)
                 .msg_type(FEISHU_TEXT_MESSAGE_TYPE)
                 .content(content)
-                .uuid(f"{message.message_id}-{uuid_suffix}-create")
+                .uuid(reply_uuid)
                 .build()
             )
             .build()
@@ -959,6 +964,7 @@ def _reply_text(message: Any, text: str, uuid_suffix: str) -> str:
 
 def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
     content = _json_lark_md_card_message(text)
+    reply_uuid = _message_reply_uuid(message.message_id or "")
 
     def _reply() -> str:
         response = client.im.v1.message.reply(
@@ -969,7 +975,7 @@ def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
                 .content(content)
                 .msg_type(FEISHU_CARD_MESSAGE_TYPE)
                 .reply_in_thread(FEISHU_REPLY_IN_THREAD)
-                .uuid(f"{message.message_id}-{uuid_suffix}")
+                .uuid(reply_uuid)
                 .build()
             )
             .build()
@@ -991,7 +997,7 @@ def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
                 .receive_id(message.chat_id)
                 .msg_type(FEISHU_CARD_MESSAGE_TYPE)
                 .content(content)
-                .uuid(f"{message.message_id}-{uuid_suffix}-create")
+                .uuid(reply_uuid)
                 .build()
             )
             .build()
@@ -1004,7 +1010,7 @@ def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
     except Exception as create_error:
         lark.logger.warning("create lark_md card message failed, fallback to text: %s", create_error, exc_info=True)
 
-    return _reply_text(message, text, f"{uuid_suffix}-text-fallback")
+    return _reply_text(message, text, uuid_suffix)
 
 
 def _reply_user_message(message: Any, text: str, uuid_suffix: str) -> str:
@@ -1576,6 +1582,8 @@ ws_client = lark.ws.Client(
 def main() -> None:
     _acquire_instance_lock()
     _ensure_local_mock_running()
+    if config.TEST_CONFIG["feishu_app_id"] == config.ONLINE_CONFIG["feishu_app_id"]:
+        lark.logger.warning("TEST 和 ONLINE 当前共用了同一个飞书应用，多个环境同时运行时会重复消费同一条消息。")
     lark.logger.info("starting Feishu bot with dify page %s", config.DIFY_APP_PAGE_URL)
     ws_client.start()
 
