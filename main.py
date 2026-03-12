@@ -33,7 +33,6 @@ from lark_oapi.api.im.v1 import (
     CreateMessageReactionRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
-    DeleteMessageRequest,
     Emoji,
     P2ImMessageMessageReadV1,
     P2ImMessageReceiveV1,
@@ -244,6 +243,9 @@ class FeishuStreamSender:
             self.reply_state.sequence += 1
             return
 
+        if self.reply_state.mode == "final_card":
+            return
+
         _update_text_message(self.reply_state.message_id, text)
 
     def _finish_message(self, text: str) -> None:
@@ -260,6 +262,10 @@ class FeishuStreamSender:
                 _finish_partial_card_text(self.reply_state.card_id, text, self.reply_state.sequence)
                 self.reply_state.sequence += 1
             self.reply_state.card_id = ""
+            return
+
+        if self.reply_state.mode == "final_card":
+            _patch_lark_md_card_message(self.reply_state.message_id, text)
             return
 
         _update_text_message(self.reply_state.message_id, text)
@@ -929,8 +935,31 @@ def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
     try:
         return _retry_lark_call("reply lark_md card message", _reply)
     except Exception as reply_error:
-        lark.logger.warning("reply lark_md card message failed, fallback to text: %s", reply_error, exc_info=True)
-        return _reply_text(message, text, f"{uuid_suffix}-text-fallback")
+        lark.logger.warning("reply lark_md card message failed, fallback to chat create: %s", reply_error, exc_info=True)
+
+    def _create() -> str:
+        response = client.im.v1.message.create(
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(message.chat_id)
+                .msg_type(FEISHU_CARD_MESSAGE_TYPE)
+                .content(content)
+                .uuid(f"{message.message_id}-{uuid_suffix}-create")
+                .build()
+            )
+            .build()
+        )
+        _raise_for_lark_failure("create lark_md card message", response)
+        return getattr(response.data, "message_id", "") or ""
+
+    try:
+        return _retry_lark_call("create lark_md card message", _create)
+    except Exception as create_error:
+        lark.logger.warning("create lark_md card message failed, fallback to text: %s", create_error, exc_info=True)
+
+    return _reply_text(message, text, f"{uuid_suffix}-text-fallback")
 
 
 def _reply_user_message(message: Any, text: str, uuid_suffix: str) -> str:
@@ -1156,22 +1185,6 @@ def _finish_partial_card_text(card_id: str, text: str, sequence: int) -> None:
     _retry_lark_call("finish partial card text", _finish)
 
 
-def _switch_reply_to_text(reply_state: ReplyMessageState, text: str) -> None:
-    old_message_id = reply_state.message_id
-    new_message_id = _create_text_message(
-        reply_state.chat_id,
-        text,
-        f"{old_message_id}-text-fallback",
-    )
-    reply_state.message_id = new_message_id
-    reply_state.mode = "text"
-    reply_state.card_id = ""
-    try:
-        _delete_message(old_message_id)
-    except Exception as exc:
-        lark.logger.warning("delete card message after text fallback failed: message_id=%s err=%s", old_message_id, exc)
-
-
 def _replace_reply_with_lark_md_card(reply_state: ReplyMessageState, text: str) -> None:
     old_message_id = reply_state.message_id
     new_message_id = _create_lark_md_card_message(
@@ -1182,10 +1195,11 @@ def _replace_reply_with_lark_md_card(reply_state: ReplyMessageState, text: str) 
     reply_state.message_id = new_message_id
     reply_state.mode = "final_card"
     reply_state.card_id = ""
-    try:
-        _delete_message(old_message_id)
-    except Exception as exc:
-        lark.logger.warning("delete old reply after lark_md card replacement failed: message_id=%s err=%s", old_message_id, exc)
+    lark.logger.warning(
+        "created additional lark_md card without deleting old reply: old_message_id=%s new_message_id=%s",
+        old_message_id,
+        new_message_id,
+    )
 
 
 def _reply_stream_message(message: Any, text: str, uuid_suffix: str) -> ReplyMessageState:
@@ -1202,10 +1216,10 @@ def _reply_stream_message(message: Any, text: str, uuid_suffix: str) -> ReplyMes
             sequence=1,
         )
     except Exception as exc:
-        lark.logger.warning("reply partial card message failed, fallback to text: %s", exc, exc_info=True)
+        lark.logger.warning("reply partial card message failed, fallback to final lark_md card mode: %s", exc, exc_info=True)
 
-    message_id = _reply_text(message, text, uuid_suffix)
-    return ReplyMessageState(message_id=message_id, chat_id=message.chat_id, mode="text")
+    message_id = _reply_lark_md_card(message, text, f"{uuid_suffix}-final-card")
+    return ReplyMessageState(message_id=message_id, chat_id=message.chat_id, mode="final_card")
 
 
 def _create_additional_partial_card_message(reply_state: ReplyMessageState) -> None:
@@ -1220,6 +1234,11 @@ def _create_additional_partial_card_message(reply_state: ReplyMessageState) -> N
     )
     reply_state.message_id = message_id
     reply_state.card_id = card_id
+
+
+def _degrade_reply_to_final_card(reply_state: ReplyMessageState) -> None:
+    reply_state.mode = "final_card"
+    reply_state.card_id = ""
 
 
 def _update_reply_message(reply_state: ReplyMessageState, text: str, streaming_mode: bool) -> None:
@@ -1237,30 +1256,22 @@ def _update_reply_message(reply_state: ReplyMessageState, text: str, streaming_m
             return
         except Exception as exc:
             lark.logger.warning(
-                "update partial card message failed, fallback to text: message_id=%s err=%s",
+                "update partial card message failed, degrade to final lark_md card: message_id=%s err=%s",
                 reply_state.message_id,
                 exc,
                 exc_info=True,
             )
             if streaming_mode:
-                _switch_reply_to_text(reply_state, text)
+                _degrade_reply_to_final_card(reply_state)
             else:
                 _replace_reply_with_lark_md_card(reply_state, text)
             return
 
+    if reply_state.mode == "final_card":
+        _patch_lark_md_card_message(reply_state.message_id, text)
+        return
+
     _update_text_message(reply_state.message_id, text)
-
-
-def _delete_message(message_id: str) -> None:
-    def _delete() -> None:
-        response = client.im.v1.message.delete(
-            DeleteMessageRequest.builder()
-            .message_id(message_id)
-            .build()
-        )
-        _raise_for_lark_failure("delete message", response)
-
-    _retry_lark_call("delete message", _delete)
 
 
 def _add_ack_reaction(message_id: str) -> None:
