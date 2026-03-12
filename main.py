@@ -64,6 +64,11 @@ PREFERRED_OUTPUT_KEYS = ("answer", "text", "output", "result", "final_text")
 MESSAGE_WORKER_COUNT = 3
 CONVERSATION_CACHE_SIZE = 1000
 RESET_CONTEXT_COMMANDS = {"/reset", "/new", "/clear", "清空上下文", "重置上下文", "新建会话"}
+CONFIG_PLACEHOLDERS = {
+    "REPLACE_WITH_FEISHU_APP_ID",
+    "REPLACE_WITH_FEISHU_APP_SECRET",
+    "REPLACE_WITH_DIFY_API_KEY",
+}
 
 PROCESSED_MESSAGES: "OrderedDict[str, float]" = OrderedDict()
 PROCESSED_MESSAGES_LOCK = threading.Lock()
@@ -99,6 +104,19 @@ def _current_build_id() -> str:
         return build_id or "unknown"
     except Exception:
         return "unknown"
+
+
+def _validate_runtime_config() -> None:
+    if config.FEISHU_APP_ID in CONFIG_PLACEHOLDERS:
+        raise BotRuntimeError("请先在 config.py 中配置真实的 FEISHU_APP_ID。")
+    if config.FEISHU_APP_SECRET in CONFIG_PLACEHOLDERS:
+        raise BotRuntimeError("请先在 config.py 中配置真实的 FEISHU_APP_SECRET。")
+    if config.DIFY_API_KEY in CONFIG_PLACEHOLDERS:
+        raise BotRuntimeError("请先在 config.py 中配置真实的 DIFY_API_KEY。")
+    if "your-dify.example.com" in config.DIFY_API_BASE_URL:
+        raise BotRuntimeError("请先在 config.py 中配置真实的 DIFY_API_BASE_URL。")
+    if "your-dify.example.com" in config.DIFY_APP_PAGE_URL:
+        raise BotRuntimeError("请先在 config.py 中配置真实的 DIFY_APP_PAGE_URL。")
 
 
 def _shutdown_message_executor() -> None:
@@ -789,6 +807,7 @@ ws_client = lark.ws.Client(
 
 def main() -> None:
     _acquire_instance_lock()
+    _validate_runtime_config()
     lark.logger.info("bot build id: %s", _current_build_id())
     lark.logger.info("starting Feishu bot with dify page %s", config.DIFY_APP_PAGE_URL)
     ws_client.start()

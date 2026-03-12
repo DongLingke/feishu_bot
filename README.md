@@ -1,59 +1,58 @@
-# 飞书知识库机器人
+# Feishu Knowledge Bot
 
-这是一个面向正式环境的飞书机器人项目。它接收飞书消息，将问题转发给上游大模型服务，并将流式回答以飞书 Markdown 卡片的形式回写给用户。
+一个面向飞书场景的知识库机器人。
 
-## 当前能力
+它做的事情很简单：
 
-- 飞书长连接消息接入
-- Dify Chat 模式对接
-- 流式 Markdown 卡片回复
-- 上下文会话延续
-- 3 路并行处理消息
+1. 接收飞书消息
+2. 把用户问题转发给上游大模型服务
+3. 把流式结果持续回写到同一条飞书 Markdown 卡片
+
+当前仓库默认内置了 Dify 适配器，但整体结构已经抽象成了“上游适配器”模式，所以后续接别的后端也比较直接。
+
+## 特性
+
+- 支持飞书长连接事件接入
+- 支持 Dify Chat 模式流式输出
+- 回复统一使用飞书 Markdown 卡片
+- 支持按“会话 + 用户”延续上下文
+- 默认支持 3 路并行处理消息
+- 上游协议已模块化，方便扩展到其他模型服务
 
 ## 项目结构
 
 ```text
 .
-├── config.py                     # 单一运行配置
-├── main.py                       # 飞书事件入口与主流程编排
+├── config.py                  # 项目配置示例
+├── main.py                    # 主入口，负责飞书事件与消息编排
 ├── feishu_bot/
-│   ├── errors.py                 # 异常定义
-│   ├── markdown_card.py          # 飞书 Markdown 卡片工具
+│   ├── errors.py              # 异常定义
+│   ├── markdown_card.py       # 飞书 Markdown 卡片构造与文本处理
 │   └── upstream/
-│       ├── base.py               # 上游服务适配协议
-│       ├── dify.py               # Dify 适配器
-│       └── template.py           # 新上游服务适配模板
+│       ├── base.py            # 上游适配器协议
+│       ├── dify.py            # Dify 适配器实现
+│       └── template.py        # 新上游服务适配模板
 ├── docs/
-│   └── upstream_adapter.md       # 上游请求/响应格式说明
-├── bootstrap.sh                  # 前台启动
-├── bootstrap.bat                 # Windows 前台启动
-├── run.sh                        # 杀旧进程并后台启动
-├── update.sh                     # 拉最新代码并重启
-└── requirements.txt              # Python 依赖
+│   └── upstream_adapter.md    # 上游请求/响应格式说明
+├── bootstrap.sh               # 前台启动
+├── bootstrap.bat              # Windows 前台启动
+├── run.sh                     # 后台启动
+├── update.sh                  # 拉最新代码并重启
+└── requirements.txt           # 依赖列表
 ```
 
-## 运行流程
+## 工作流程
 
-1. 飞书通过长连接推送消息事件。
-2. 主程序将消息转换成统一的 `UpstreamRequest`。
-3. `feishu_bot/upstream/dify.py` 负责构造 Dify 请求并解析 SSE 响应。
-4. 主程序把流式结果 patch 到同一条飞书 Markdown 卡片。
+1. 飞书通过长连接把消息事件推给机器人
+2. 机器人解析消息文本，并给原消息加确认表情
+3. 主程序把消息转换成统一的 `UpstreamRequest`
+4. 上游适配器负责把标准请求转换成目标后端需要的请求体
+5. 上游流式返回事件后，再统一转换成 `UpstreamStreamEvent`
+6. 主程序把增量内容持续 patch 到同一条飞书 Markdown 卡片
 
-## 配置
+## 快速开始
 
-项目只保留一套正式环境配置，位于 [config.py](/Users/donglingke/Documents/Code/dify_feishu_notify/config.py)：
-
-- `FEISHU_APP_ID`
-- `FEISHU_APP_SECRET`
-- `DIFY_APP_TYPE`
-- `DIFY_APP_PAGE_URL`
-- `DIFY_API_BASE_URL`
-- `DIFY_API_PATH`
-- `DIFY_API_KEY`
-
-当前默认配置为 Dify Chat API。
-
-## 启动
+### 1. 安装依赖
 
 macOS / Linux:
 
@@ -67,7 +66,32 @@ Windows:
 bootstrap.bat
 ```
 
-后台重启：
+### 2. 配置参数
+
+先打开 `config.py`，把下面这些占位值换成你自己的配置：
+
+- `FEISHU_APP_ID`
+- `FEISHU_APP_SECRET`
+- `DIFY_APP_PAGE_URL`
+- `DIFY_API_BASE_URL`
+- `DIFY_API_KEY`
+
+默认配置是 Dify Chat API：
+
+```python
+DIFY_APP_TYPE = "chat"
+DIFY_API_PATH = "/chat-messages"
+```
+
+### 3. 启动服务
+
+前台运行：
+
+```bash
+python3 main.py
+```
+
+后台运行：
 
 ```bash
 ./run.sh
@@ -79,19 +103,21 @@ bootstrap.bat
 ./update.sh
 ```
 
-## 上游服务适配
+## 飞书权限
 
-如果后续需要接其他后端服务，直接参考：
+至少需要这些权限：
 
-- [feishu_bot/upstream/base.py](/Users/donglingke/Documents/Code/dify_feishu_notify/feishu_bot/upstream/base.py)
-- [feishu_bot/upstream/template.py](/Users/donglingke/Documents/Code/dify_feishu_notify/feishu_bot/upstream/template.py)
-- [docs/upstream_adapter.md](/Users/donglingke/Documents/Code/dify_feishu_notify/docs/upstream_adapter.md)
+- `im:message`
+- `im:message:write`
+- `im:message:reaction`
+
+如果你使用的是企业内部应用，还需要在飞书后台把机器人加到对应群聊或可见范围中。
 
 ## 上下文会话
 
-Chat 模式下，项目会按“聊天会话 + 用户”缓存 Dify `conversation_id`。
+Chat 模式下，项目会缓存上游返回的 `conversation_id`，因此同一个用户连续追问时会自动带上上下文。
 
-手动清空上下文命令：
+支持手动清空上下文：
 
 - `/reset`
 - `/new`
@@ -99,3 +125,35 @@ Chat 模式下，项目会按“聊天会话 + 用户”缓存 Dify `conversatio
 - `清空上下文`
 - `重置上下文`
 - `新建会话`
+
+## 扩展上游服务
+
+如果你不想用 Dify，而是要接别的后端，可以直接参考这几个文件：
+
+- `feishu_bot/upstream/base.py`
+- `feishu_bot/upstream/template.py`
+- `docs/upstream_adapter.md`
+
+你只需要做两件事：
+
+1. 把标准请求转换成目标上游的请求体
+2. 把目标上游的响应转换成统一的流式事件
+
+主程序不需要重新设计消息流转逻辑。
+
+## 当前限制
+
+- 当前配置文件是直接写在仓库里的示例配置，适合快速理解和二次开发；如果你要正式部署，建议改成环境变量或私有配置文件
+- 当前默认并发数为 3，如果你的上游后端吞吐更高，可以在代码里调大
+- 当前仓库默认以 Dify Chat 为主，虽然适配器层兼容更多协议，但还没有内置其他后端实现
+
+## 适合谁
+
+如果你想要一个：
+
+- 结构尽量简单
+- 能直接跑起来
+- 能继续扩展上游后端
+- 适合二次开发的飞书机器人
+
+那这个项目应该是一个不错的起点。

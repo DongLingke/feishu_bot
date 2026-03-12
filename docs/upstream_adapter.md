@@ -1,17 +1,19 @@
 # 上游服务适配器说明
 
-## 目标
+## 为什么要抽这一层
 
-本项目不再把 Dify 请求逻辑直接写死在主程序中，而是通过“上游服务适配器”来对接不同后端。
+飞书机器人本身只关心两件事：
 
-当前标准入口在：
+1. 用户问了什么
+2. 上游流式回了什么
 
-- `/Users/donglingke/Documents/Code/dify_feishu_notify/feishu_bot/upstream/base.py`
-- `/Users/donglingke/Documents/Code/dify_feishu_notify/feishu_bot/upstream/dify.py`
+至于上游到底是 Dify、内部模型网关，还是其他第三方服务，主程序不应该知道太多细节。
 
-## 当前服务发给上游服务的数据格式
+所以项目里把这部分统一抽象成了“上游适配器”。
 
-主程序先把飞书消息转换成统一的 `UpstreamRequest`：
+## 标准请求格式
+
+当前服务发给上游适配器的是统一对象：
 
 ```python
 UpstreamRequest(
@@ -24,12 +26,12 @@ UpstreamRequest(
 字段说明：
 
 - `query`: 当前轮用户输入
-- `user_id`: 用户唯一标识，默认取飞书 `open_id/user_id/union_id`
-- `conversation_id`: 上下文会话标识，由上游服务返回并在后续请求中复用
+- `user_id`: 当前用户标识
+- `conversation_id`: 上下文会话标识，没有就传空字符串
 
-## 上游服务回给当前服务的数据格式
+## 标准流式响应格式
 
-适配器需要把上游原始响应转换成统一的 `UpstreamStreamEvent`：
+适配器返回给主程序的是统一对象：
 
 ```python
 UpstreamStreamEvent(
@@ -40,24 +42,26 @@ UpstreamStreamEvent(
     finished=False,
     finish_status="",
     outputs=None,
-    raw_event={"上游原始事件": "..."},
+    raw_event={},
 )
 ```
 
 字段说明：
 
 - `event`: 上游原始事件名
-- `text`: 当前事件带回的文本
-- `replace_text`: 是否用本次文本替换历史累计文本
-- `conversation_id`: 当前会话 ID
-- `finished`: 是否已经结束
+- `text`: 当前事件携带的文本内容
+- `replace_text`: 是否直接替换历史文本
+- `conversation_id`: 上游返回的上下文 ID
+- `finished`: 是否为结束事件
 - `finish_status`: 结束状态，例如 `succeeded`、`failed`
-- `outputs`: 结束事件中的完整输出对象
-- `raw_event`: 原始事件内容，便于日志和排错
+- `outputs`: 结束事件里的完整输出对象
+- `raw_event`: 原始事件内容，便于日志排查
 
-## Dify 适配规则
+## Dify 请求格式
 
-### chat 模式请求体
+### Chat 模式
+
+当前服务发送给 Dify 的 JSON：
 
 ```json
 {
@@ -69,7 +73,9 @@ UpstreamStreamEvent(
 }
 ```
 
-### workflow 模式请求体
+### Workflow 模式
+
+当前服务发送给 Dify 的 JSON：
 
 ```json
 {
@@ -84,22 +90,35 @@ UpstreamStreamEvent(
 }
 ```
 
-### Dify 流式事件映射
+## Dify 返回格式
 
-- `message` / `agent_message` -> `UpstreamStreamEvent.text`
-- `message_replace` -> `UpstreamStreamEvent.text` 且 `replace_text=True`
-- `message_end` / `workflow_finished` -> `finished=True`
-- `conversation_id` -> 统一提取并回写到会话缓存
+常见的 SSE 事件包括：
 
-## 新接一个上游服务要做什么
+- `message`
+- `agent_message`
+- `message_replace`
+- `message_end`
+- `text_chunk`
+- `workflow_finished`
+- `error`
 
-1. 新建一个适配器文件，例如 `feishu_bot/upstream/xxx.py`
-2. 继承 `UpstreamAdapter`
-3. 实现：
-   - `request_schema`
-   - `response_schema`
-   - `build_request_payload`
-   - `stream`
-4. 在主程序里替换当前 `DifyAdapter` 实例
+适配器会把这些原始事件映射成统一的 `UpstreamStreamEvent`，主程序只消费统一格式。
 
-这样主程序无需关心后端细节，只消费统一的 `UpstreamRequest` 和 `UpstreamStreamEvent`。
+## 如何接一个新的后端
+
+复制 `feishu_bot/upstream/template.py`，然后完成这四件事：
+
+1. 定义你的 `request_schema`
+2. 定义你的 `response_schema`
+3. 实现 `build_request_payload`
+4. 实现 `stream`
+
+如果你的上游是 SSE、WebSocket、普通轮询接口，都可以在适配器层自行转换，只要最后 yield 出统一的 `UpstreamStreamEvent` 即可。
+
+## 设计目标
+
+这层抽象的目的是：
+
+- 让主程序不依赖某个具体厂商
+- 让接入新后端时改动范围尽量小
+- 让请求和响应格式足够清晰，便于排查和二次开发
