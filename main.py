@@ -7,12 +7,10 @@ import json
 import os
 import queue
 import re
-import socket
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -34,6 +32,15 @@ from lark_oapi.api.im.v1 import (
 )
 
 import config
+from feishu_bot.errors import BotRuntimeError, DifyRequestError, FeishuRequestError
+from feishu_bot.markdown_card import (
+    build_lark_md_card_json,
+    prepare_streaming_preview_text,
+    trim_message_text,
+    trim_text,
+)
+from feishu_bot.upstream.base import UpstreamRequest
+from feishu_bot.upstream.dify import DifyAdapter
 
 try:
     import fcntl
@@ -76,6 +83,17 @@ INSTANCE_LOCK_FILE = os.path.join(os.path.dirname(__file__), "bot.lock")
 INSTANCE_LOCK_HANDLE: Any | None = None
 CONVERSATION_CACHE: "OrderedDict[str, str]" = OrderedDict()
 CONVERSATION_CACHE_LOCK = threading.Lock()
+UPSTREAM_ADAPTER = DifyAdapter(
+    app_type=config.DIFY_APP_TYPE,
+    api_base_url=config.DIFY_API_BASE_URL,
+    api_path=config.DIFY_API_PATH,
+    api_key=config.DIFY_API_KEY,
+    query_input_keys=config.DIFY_QUERY_INPUT_KEYS,
+    fixed_inputs=config.DIFY_FIXED_INPUTS,
+    request_timeout_seconds=config.DIFY_REQUEST_TIMEOUT_SECONDS,
+    max_error_body_chars=MAX_ERROR_BODY_CHARS,
+    preferred_output_keys=PREFERRED_OUTPUT_KEYS,
+)
 
 
 def _current_build_id() -> str:
@@ -113,23 +131,6 @@ def _release_instance_lock() -> None:
 
 atexit.register(_shutdown_message_executor)
 atexit.register(_release_instance_lock)
-
-
-class BotRuntimeError(Exception):
-    pass
-
-
-class DifyRequestError(BotRuntimeError):
-    def __init__(self, summary: str, detail: str = "") -> None:
-        super().__init__(summary)
-        self.summary = summary
-        self.detail = detail
-
-
-class FeishuRequestError(BotRuntimeError):
-    def __init__(self, message: str, code: str = "") -> None:
-        super().__init__(message)
-        self.code = str(code or "")
 
 
 @dataclass
@@ -221,7 +222,7 @@ class FeishuStreamSender:
                 continue
 
             text = self._get_safe_send_text(item)
-            text = _prepare_streaming_preview_text(text)
+            text = prepare_streaming_preview_text(text)
 
             try:
                 started_at = time.time()
@@ -260,75 +261,11 @@ class FeishuStreamSender:
     def _get_safe_send_text(self, data: str) -> str:
         text = re.sub(r"(?m)^\s+(?=```)", "", data)
         text = re.sub(r"!\[(.*?)\]\((.*?)\)", r"\1 \2", text)
-        return _trim_message_text(text)
+        return trim_message_text(text, FEISHU_MAX_MESSAGE_CHARS)
 
 
 def _lark_log_level() -> Any:
     return getattr(lark.LogLevel, config.FEISHU_LOG_LEVEL, lark.LogLevel.DEBUG)
-
-
-def _trim_text(value: Any, limit: int) -> str:
-    text = value if isinstance(value, str) else str(value)
-    if len(text) <= limit:
-        return text
-    return text[: limit - 20] + "\n...[truncated]..."
-
-
-def _trim_message_text(text: str) -> str:
-    if len(text) <= FEISHU_MAX_MESSAGE_CHARS:
-        return text
-    suffix = "\n\n[内容过长，已截断]"
-    allowed = max(0, FEISHU_MAX_MESSAGE_CHARS - len(suffix))
-    return text[:allowed] + suffix
-
-
-def _normalize_lark_md(text: str) -> str:
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    normalized_lines: list[str] = []
-    in_code_block = False
-
-    for raw_line in lines:
-        line = raw_line.rstrip()
-
-        if line.startswith("```"):
-            in_code_block = not in_code_block
-            normalized_lines.append(line)
-            continue
-
-        if in_code_block:
-            normalized_lines.append(line)
-            continue
-
-        heading_match = re.match(r"^(#{1,6})\s+(.+)$", line)
-        if heading_match:
-            title = heading_match.group(2).strip()
-            normalized_lines.append(f"**{title}**" if title else "")
-            continue
-
-        bullet_match = re.match(r"^(\s*)[-*+]\s+(.+)$", line)
-        if bullet_match:
-            indent = bullet_match.group(1)
-            item = bullet_match.group(2).strip()
-            normalized_lines.append(f"{indent}• {item}" if item else "")
-            continue
-
-        ordered_match = re.match(r"^(\s*)(\d+)\.\s+(.+)$", line)
-        if ordered_match:
-            indent = ordered_match.group(1)
-            index = ordered_match.group(2)
-            item = ordered_match.group(3).strip()
-            normalized_lines.append(f"{indent}{index}. {item}" if item else "")
-            continue
-
-        if re.match(r"^\s*([-*_])\1{2,}\s*$", line):
-            normalized_lines.append("----------")
-            continue
-
-        normalized_lines.append(line)
-
-    normalized_text = "\n".join(normalized_lines)
-    normalized_text = re.sub(r"\n{3,}", "\n\n", normalized_text).strip()
-    return normalized_text
 
 
 def _message_reply_uuid(message_id: str) -> str:
@@ -336,35 +273,7 @@ def _message_reply_uuid(message_id: str) -> str:
 
 
 def _json_lark_md_card_message(text: str) -> str:
-    return _json_final_card_data(text)
-
-
-def _prepare_streaming_preview_text(text: str) -> str:
-    if text.count("```") % 2 == 1:
-        return f"{text}\n```"
-    return text
-
-
-def _json_final_card_data(text: str) -> str:
-    final_text = _trim_message_text(_normalize_lark_md(text))
-    card = {
-        "schema": "2.0",
-        "config": {
-            "width_mode": "fill",
-        },
-        "body": {
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": final_text,
-                    },
-                }
-            ]
-        },
-    }
-    return json.dumps(card, ensure_ascii=False)
+    return build_lark_md_card_json(text, FEISHU_MAX_MESSAGE_CHARS)
 
 
 def _decode_bytes(value: Any) -> str:
@@ -375,7 +284,7 @@ def _decode_bytes(value: Any) -> str:
 
 def _response_detail(response: Any) -> str:
     raw = getattr(getattr(response, "raw", None), "content", b"")
-    return _trim_text(_decode_bytes(raw), MAX_ERROR_BODY_CHARS)
+    return trim_text(_decode_bytes(raw), MAX_ERROR_BODY_CHARS)
 
 
 def _is_message_edit_limit_error(exc: Exception) -> bool:
@@ -583,179 +492,10 @@ def _clear_conversation_id(session_key: str) -> bool:
         return CONVERSATION_CACHE.pop(session_key, None) is not None
 
 
-def _build_workflow_inputs(query: str) -> dict[str, object]:
-    inputs: dict[str, object] = dict(config.DIFY_FIXED_INPUTS)
-    for key in config.DIFY_QUERY_INPUT_KEYS:
-        inputs[key] = query
-    return inputs
-
-
-def _dify_app_type() -> str:
-    return str(config.DIFY_APP_TYPE or "workflow").strip().lower()
-
-
-def _build_dify_request_body(query: str, user_identifier: str, conversation_id: str = "") -> dict[str, object]:
-    if _dify_app_type() == "chat":
-        body: dict[str, object] = {
-            "inputs": dict(config.DIFY_FIXED_INPUTS),
-            "query": query,
-            "response_mode": "streaming",
-            "user": user_identifier,
-        }
-        if conversation_id:
-            body["conversation_id"] = conversation_id
-        return body
-
-    return {
-        "inputs": _build_workflow_inputs(query),
-        "response_mode": "streaming",
-        "user": user_identifier,
-    }
-
-
-def _format_dify_http_error(status: int, body: str) -> str:
-    code = ""
-    message = ""
-    try:
-        payload = json.loads(body)
-        if isinstance(payload, dict):
-            code = str(payload.get("code") or "")
-            message = str(payload.get("message") or "")
-    except json.JSONDecodeError:
-        pass
-
-    detail = f"HTTP {status}"
-    if code:
-        detail += f", code={code}"
-    if message:
-        detail += f", message={message}"
-    if body:
-        detail += f", body={_trim_text(body, MAX_ERROR_BODY_CHARS)}"
-    return detail
-
-
-def _iter_sse_events(response) -> Any:
-    event_name = ""
-    data_lines: list[str] = []
-
-    while True:
-        raw_line = response.readline()
-        if not raw_line:
-            if event_name or data_lines:
-                yield _parse_sse_event(event_name, data_lines)
-            break
-
-        line = raw_line.decode("utf-8", errors="ignore").rstrip("\r\n")
-        if not line:
-            if event_name or data_lines:
-                yield _parse_sse_event(event_name, data_lines)
-                event_name = ""
-                data_lines = []
-            continue
-
-        if line.startswith(":"):
-            continue
-
-        field, _, value = line.partition(":")
-        value = value.lstrip(" ")
-        if field == "event":
-            event_name = value
-        elif field == "data":
-            data_lines.append(value)
-
-
-def _parse_sse_event(event_name: str, data_lines: list[str]) -> dict[str, Any]:
-    payload_text = "\n".join(data_lines).strip()
-    if not payload_text:
-        return {"event": event_name, "_raw": ""}
-    if payload_text == "[DONE]":
-        return {"event": event_name or "done", "_raw": payload_text}
-
-    try:
-        payload = json.loads(payload_text)
-    except json.JSONDecodeError:
-        return {"event": event_name, "_raw": payload_text}
-
-    if isinstance(payload, dict):
-        if event_name and "event" not in payload:
-            payload["event"] = event_name
-        payload["_raw"] = payload_text
-        return payload
-
-    return {"event": event_name, "data": payload, "_raw": payload_text}
-
-
-def _extract_best_output_text(outputs: Any) -> str:
-    if isinstance(outputs, str):
-        return outputs.strip()
-    if isinstance(outputs, list):
-        parts = [_extract_best_output_text(item) for item in outputs]
-        parts = [part for part in parts if part]
-        return "\n".join(parts)
-    if isinstance(outputs, dict):
-        for key in PREFERRED_OUTPUT_KEYS:
-            if key in outputs:
-                preferred = _extract_best_output_text(outputs[key])
-                if preferred:
-                    return preferred
-        if len(outputs) == 1:
-            only_value = next(iter(outputs.values()))
-            return _extract_best_output_text(only_value)
-        return json.dumps(outputs, ensure_ascii=False, indent=2)
-    return ""
-
-
-def _dify_stream(query: str, user_identifier: str, conversation_id: str = "") -> Any:
-    app_type = _dify_app_type()
-    if not config.DIFY_API_KEY:
-        raise DifyRequestError(
-            "DIFY_API_KEY is empty",
-            "config.py 中没有配置 Dify API Key",
-        )
-
-    url = config.DIFY_API_BASE_URL.rstrip("/") + "/" + config.DIFY_API_PATH.lstrip("/")
-    request_body = _build_dify_request_body(query, user_identifier, conversation_id)
-    encoded_body = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=encoded_body,
-        headers={
-            "Authorization": f"Bearer {config.DIFY_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-
-    lark.logger.info("start dify %s stream: url=%s body=%s", app_type, url, request_body)
-
-    try:
-        with urllib.request.urlopen(request, timeout=config.DIFY_REQUEST_TIMEOUT_SECONDS) as response:
-            for event in _iter_sse_events(response):
-                yield event
-    except urllib.error.HTTPError as exc:
-        body = _decode_bytes(exc.read())
-        raise DifyRequestError(
-            f"Dify {app_type} HTTP error",
-            _format_dify_http_error(exc.code, body),
-        ) from exc
-    except urllib.error.URLError as exc:
-        if isinstance(exc.reason, socket.timeout):
-            raise DifyRequestError(
-                f"Dify {app_type} timeout",
-                f"socket timeout after {config.DIFY_REQUEST_TIMEOUT_SECONDS}s",
-            ) from exc
-        raise DifyRequestError(f"Dify {app_type} request failed", str(exc.reason)) from exc
-    except socket.timeout as exc:
-        raise DifyRequestError(
-            f"Dify {app_type} timeout",
-            f"socket timeout after {config.DIFY_REQUEST_TIMEOUT_SECONDS}s",
-        ) from exc
-
-
 def _format_error_message(summary: str, detail: str = "") -> str:
     text = f"[错误] {summary}"
     if detail:
-        text += f"\n{_trim_text(detail, MAX_ERROR_BODY_CHARS)}"
+        text += f"\n{trim_text(detail, MAX_ERROR_BODY_CHARS)}"
     return text
 
 
@@ -772,77 +512,6 @@ def _format_finished_status(data: dict[str, Any]) -> str:
     if error:
         pieces.append(f"error={error}")
     return ", ".join(pieces)
-
-
-def _format_stream_error_event(event: dict[str, Any]) -> str:
-    code = str(event.get("code") or "")
-    message = str(event.get("message") or "").strip()
-    status = str(event.get("status") or "").strip()
-    pieces = []
-    if status:
-        pieces.append(f"status={status}")
-    if code:
-        pieces.append(f"code={code}")
-    if message:
-        pieces.append(f"message={message}")
-    if not pieces:
-        pieces.append(_trim_text(event.get("_raw") or event, MAX_ERROR_BODY_CHARS))
-    return ", ".join(pieces)
-
-
-def _extract_chat_event_text(event: dict[str, Any]) -> str:
-    direct_text = event.get("answer")
-    if isinstance(direct_text, str) and direct_text:
-        return direct_text
-
-    data = event.get("data")
-    if isinstance(data, dict):
-        data_answer = data.get("answer")
-        if isinstance(data_answer, str) and data_answer:
-            return data_answer
-
-        outputs = data.get("outputs")
-        text = _extract_best_output_text(outputs)
-        if text:
-            return text
-
-    outputs = event.get("outputs")
-    text = _extract_best_output_text(outputs)
-    if text:
-        return text
-
-    return ""
-
-
-def _extract_event_conversation_id(event: dict[str, Any]) -> str:
-    value = event.get("conversation_id")
-    if isinstance(value, str) and value:
-        return value
-
-    data = event.get("data")
-    if isinstance(data, dict):
-        nested_value = data.get("conversation_id")
-        if isinstance(nested_value, str) and nested_value:
-            return nested_value
-
-    return ""
-
-
-def _extract_stream_text(event_name: str, event: dict[str, Any]) -> tuple[str, bool]:
-    if event_name == "text_chunk":
-        data = event.get("data") or {}
-        text = data.get("text")
-        return (text, False) if isinstance(text, str) else ("", False)
-
-    if event_name in {"message", "agent_message"}:
-        text = _extract_chat_event_text(event)
-        return (text, False) if text else ("", False)
-
-    if event_name == "message_replace":
-        text = _extract_chat_event_text(event)
-        return (text, True) if text else ("", False)
-
-    return "", False
 
 
 def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
@@ -929,7 +598,7 @@ def _stream_dify_to_message(
     session_key: str,
     extra_notice: str = "",
 ) -> None:
-    app_type = _dify_app_type()
+    app_type = str(config.DIFY_APP_TYPE or "workflow").strip().lower()
     accumulated_text = ""
     stream_finished = False
     stream_sender = FeishuStreamSender(reply_state)
@@ -937,20 +606,27 @@ def _stream_dify_to_message(
     current_conversation_id = _get_conversation_id(session_key) if app_type == "chat" else ""
 
     try:
-        for event in _dify_stream(query, user_identifier, current_conversation_id):
-            event_name = str(event.get("event") or "")
-            lark.logger.debug("dify stream event: %s", event_name or event)
+        upstream_request = UpstreamRequest(
+            query=query,
+            user_id=user_identifier,
+            conversation_id=current_conversation_id,
+        )
+        request_payload = UPSTREAM_ADAPTER.build_request_payload(upstream_request)
+        url = config.DIFY_API_BASE_URL.rstrip("/") + "/" + config.DIFY_API_PATH.lstrip("/")
+        lark.logger.info("start dify %s stream: url=%s body=%s", app_type, url, request_payload)
 
-            new_conversation_id = _extract_event_conversation_id(event)
+        for upstream_event in UPSTREAM_ADAPTER.stream(upstream_request):
+            event_name = upstream_event.event
+            lark.logger.debug("dify stream event: %s", event_name or upstream_event.raw_event)
+
+            new_conversation_id = upstream_event.conversation_id
             if app_type == "chat" and new_conversation_id and new_conversation_id != current_conversation_id:
                 current_conversation_id = new_conversation_id
                 _set_conversation_id(session_key, current_conversation_id)
                 lark.logger.info("dify conversation updated: session=%s conversation_id=%s", session_key, current_conversation_id)
 
-            if event_name == "error":
-                raise DifyRequestError(f"Dify {app_type} stream error", _format_stream_error_event(event))
-
-            chunk_text, replace_text = _extract_stream_text(event_name, event)
+            chunk_text = upstream_event.text
+            replace_text = upstream_event.replace_text
             if chunk_text:
                 if replace_text:
                     accumulated_text = chunk_text
@@ -966,19 +642,15 @@ def _stream_dify_to_message(
                 stream_sender.add(accumulated_text)
                 continue
 
-            if event_name in {"workflow_finished", "message_end"}:
+            if upstream_event.finished:
                 stream_finished = True
-                data = event.get("data") or event
-                if event_name == "workflow_finished" and not accumulated_text:
-                    accumulated_text = _extract_best_output_text(data.get("outputs"))
-                if event_name == "message_end" and not accumulated_text:
-                    accumulated_text = _extract_chat_event_text(event)
-
                 final_text = accumulated_text or FEISHU_EMPTY_RESULT_TEXT
-                if event_name == "workflow_finished" and str(data.get("status") or "") != "succeeded":
+                raw_event = upstream_event.raw_event or {}
+                finished_data = raw_event.get("data") if isinstance(raw_event.get("data"), dict) else raw_event
+                if event_name == "workflow_finished" and upstream_event.finish_status != "succeeded":
                     final_text = (
                         f"{final_text}\n\n"
-                        f"{_format_error_message('Dify workflow ended abnormally', _format_finished_status(data))}"
+                        f"{_format_error_message('Dify workflow ended abnormally', _format_finished_status(finished_data if isinstance(finished_data, dict) else {}))}"
                     ).strip()
                 if extra_notice:
                     final_text = f"{final_text}\n\n[提示] {extra_notice}"
@@ -992,25 +664,14 @@ def _stream_dify_to_message(
                     app_type,
                     reply_state.message_id,
                     event_name,
-                    data.get("status"),
+                    upstream_event.finish_status,
                     len(final_text),
                     stream_sender.sent_update_count,
                 )
                 break
 
-            if event_name in {
-                "workflow_started",
-                "node_started",
-                "node_finished",
-                "agent_thought",
-                "message_file",
-                "ping",
-                "tts_message",
-                "tts_message_end",
-            }:
-                continue
-
-            lark.logger.warning("unknown dify event: %s", event.get("_raw") or event)
+            if event_name:
+                lark.logger.warning("unknown upstream event: %s", upstream_event.raw_event or event_name)
 
         if not stream_finished:
             stream_sender.close()
@@ -1069,34 +730,34 @@ def _handle_received_message(data: P2ImMessageReceiveV1) -> None:
     except Exception as exc:
         error_text = _format_error_message("消息解析失败", str(exc))
         if reaction_error:
-            error_text += f"\n[提示] 表情回复失败: {_trim_text(reaction_error, 300)}"
+            error_text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
         _reply_user_message(message, error_text, "parse-error")
         return
 
     if message.message_type != "text":
         text = _format_error_message("暂不支持该消息类型", f"message_type={message.message_type}")
         if reaction_error:
-            text += f"\n[提示] 表情回复失败: {_trim_text(reaction_error, 300)}"
+            text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
         _reply_user_message(message, text, "unsupported")
         return
 
     if not query:
         text = _format_error_message("消息内容为空", "未转发到 Dify")
         if reaction_error:
-            text += f"\n[提示] 表情回复失败: {_trim_text(reaction_error, 300)}"
+            text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
         _reply_user_message(message, text, "empty")
         return
 
     user_identifier = _sender_user_id(data)
     session_key = _conversation_session_key(message, user_identifier)
 
-    if _dify_app_type() == "chat" and query.strip() in RESET_CONTEXT_COMMANDS:
+    if str(config.DIFY_APP_TYPE or "workflow").strip().lower() == "chat" and query.strip() in RESET_CONTEXT_COMMANDS:
         existed = _clear_conversation_id(session_key)
         reset_text = "已清空当前会话上下文。接下来我会从新的对话开始回答。"
         if not existed:
             reset_text = "当前没有可清空的会话上下文。接下来我会从新的对话开始回答。"
         if reaction_error:
-            reset_text += f"\n\n[提示] 表情回复失败: {_trim_text(reaction_error, 300)}"
+            reset_text += f"\n\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
         _reply_user_message(message, reset_text, "reset-context")
         return
 
@@ -1116,13 +777,13 @@ def _handle_received_message(data: P2ImMessageReceiveV1) -> None:
         lark.logger.error("dify request failed: %s | %s", exc.summary, exc.detail)
         error_text = _format_error_message(exc.summary, exc.detail)
         if reaction_error:
-            error_text += f"\n[提示] 表情回复失败: {_trim_text(reaction_error, 300)}"
+            error_text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
         _update_reply_message(reply_state, error_text, streaming_mode=False)
     except Exception as exc:
         lark.logger.error("unexpected handler error: %s", exc, exc_info=True)
         error_text = _format_error_message("处理消息时发生未预期错误", str(exc))
         if reaction_error:
-            error_text += f"\n[提示] 表情回复失败: {_trim_text(reaction_error, 300)}"
+            error_text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
         _update_reply_message(reply_state, error_text, streaming_mode=False)
 
 
