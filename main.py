@@ -20,15 +20,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 import lark_oapi as lark
-from lark_oapi.api.cardkit.v1 import (
-    Card,
-    ContentCardElementRequest,
-    ContentCardElementRequestBody,
-    CreateCardRequest,
-    CreateCardRequestBody,
-    UpdateCardRequest,
-    UpdateCardRequestBody,
-)
 from lark_oapi.api.im.v1 import (
     CreateMessageReactionRequest,
     CreateMessageReactionRequestBody,
@@ -42,8 +33,6 @@ from lark_oapi.api.im.v1 import (
     PatchMessageRequestBody,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
-    UpdateMessageRequest,
-    UpdateMessageRequestBody,
 )
 
 import config
@@ -60,10 +49,7 @@ FEISHU_ACK_REACTION_EMOJI_TYPE = "DONE"
 FEISHU_PLACEHOLDER_TEXT = "正在处理中，请稍候..."
 FEISHU_EMPTY_RESULT_TEXT = "工作流已结束，但没有返回可展示的文本结果。"
 FEISHU_MAX_MESSAGE_CHARS = 28000
-FEISHU_TEXT_MESSAGE_TYPE = "text"
 FEISHU_CARD_MESSAGE_TYPE = "interactive"
-FEISHU_PARTIAL_CARD_ELEMENT_ID = "markdown_1"
-FEISHU_PARTIAL_CARD_STATUS_ELEMENT_ID = "markdown_2"
 
 LOCAL_DIFY_MOCK_HOST = "127.0.0.1"
 LOCAL_DIFY_MOCK_PORT = 18080
@@ -74,12 +60,11 @@ MESSAGE_MAX_AGE_MS = 120000
 MESSAGE_CACHE_SIZE = 1000
 STREAM_QUEUE_MIN_CHARS = 10
 STREAM_QUEUE_INTERVAL_SECONDS = 0.2
-PARTIAL_CARD_MAX_CHARS = 20 * 1024
 API_RETRY_TIMES = 3
 API_RETRY_BASE_SECONDS = 1.0
 MAX_ERROR_BODY_CHARS = 1500
 PREFERRED_OUTPUT_KEYS = ("answer", "text", "output", "result", "final_text")
-MESSAGE_WORKER_COUNT = 8
+MESSAGE_WORKER_COUNT = 3
 
 PROCESSED_MESSAGES: "OrderedDict[str, float]" = OrderedDict()
 PROCESSED_MESSAGES_LOCK = threading.Lock()
@@ -135,9 +120,6 @@ class FeishuRequestError(BotRuntimeError):
 class ReplyMessageState:
     message_id: str
     chat_id: str
-    mode: str
-    card_id: str = ""
-    sequence: int = 1
 
 
 class FeishuStreamSender:
@@ -155,7 +137,6 @@ class FeishuStreamSender:
         self._last_error: Exception | None = None
         self._last_msg_content = ""
         self._flushed = False
-        self._length_limit_holder = ""
         self._stopped = False
 
     def start(self) -> None:
@@ -204,7 +185,6 @@ class FeishuStreamSender:
 
     def _run(self) -> None:
         self._last_enqueue_at = time.time()
-        self._length_limit_holder = ""
 
         while True:
             item = self._queue.get()
@@ -219,7 +199,6 @@ class FeishuStreamSender:
                     safe_text = self._get_safe_send_text(final_text)
                     self._finish_message(safe_text)
                     self._flushed = True
-                    self._length_limit_holder = ""
                 continue
 
             if not isinstance(item, str) or not item:
@@ -257,70 +236,15 @@ class FeishuStreamSender:
                 self._last_error = exc
 
     def _send_or_update_message(self, text: str) -> None:
-        if self.reply_state.mode == "final_card":
-            _patch_lark_md_card_message(self.reply_state.message_id, text)
-            return
-
-        if self.reply_state.mode == "card":
-            if not self.reply_state.card_id:
-                _create_additional_partial_card_message(self.reply_state)
-            _update_partial_card_text(self.reply_state.card_id, text, self.reply_state.sequence)
-            self.reply_state.sequence += 1
-            return
-
-        _update_text_message(self.reply_state.message_id, text)
+        _patch_lark_md_card_message(self.reply_state.message_id, text)
 
     def _finish_message(self, text: str) -> None:
-        if self.reply_state.mode == "card" and self.reply_state.card_id:
-            try:
-                _patch_lark_md_card_message(self.reply_state.message_id, text)
-            except Exception as exc:
-                lark.logger.warning(
-                    "patch final lark_md card failed, fallback to cardkit final update: message_id=%s err=%s",
-                    self.reply_state.message_id,
-                    exc,
-                    exc_info=True,
-                )
-                _finish_partial_card_text(self.reply_state.card_id, text, self.reply_state.sequence)
-                self.reply_state.sequence += 1
-            self.reply_state.card_id = ""
-            return
-
-        if self.reply_state.mode == "final_card":
-            _patch_lark_md_card_message(self.reply_state.message_id, text)
-            return
-
-        _update_text_message(self.reply_state.message_id, text)
+        _patch_lark_md_card_message(self.reply_state.message_id, text)
 
     def _get_safe_send_text(self, data: str) -> str:
-        text = data
-
-        while len(text) > PARTIAL_CARD_MAX_CHARS:
-            if self._length_limit_holder and text.startswith(self._length_limit_holder):
-                text = text[len(self._length_limit_holder) :]
-
-            if len(text) <= PARTIAL_CARD_MAX_CHARS:
-                break
-
-            index = text.rfind("\n\n", 0, PARTIAL_CARD_MAX_CHARS)
-            if index <= 0:
-                index = PARTIAL_CARD_MAX_CHARS
-            else:
-                index += 2
-
-            split = text[:index]
-            if split.count("```") % 2 == 1:
-                index2 = text.rfind("```", 0, PARTIAL_CARD_MAX_CHARS)
-                if index2 > 0 and len(text) - index2 < PARTIAL_CARD_MAX_CHARS:
-                    index = index2
-                    split = text[:index]
-
-            self._finish_message(split)
-            self._length_limit_holder += split
-            text = text[index:]
-
-        text = re.sub(r"(?m)^\s+(?=```)", "", text)
-        return re.sub(r"!\[(.*?)\]\((.*?)\)", r"\1 \2", text)
+        text = re.sub(r"(?m)^\s+(?=```)", "", data)
+        text = re.sub(r"!\[(.*?)\]\((.*?)\)", r"\1 \2", text)
+        return _trim_message_text(text)
 
 
 def _lark_log_level() -> Any:
@@ -391,10 +315,6 @@ def _normalize_lark_md(text: str) -> str:
     return normalized_text
 
 
-def _json_text_message(text: str) -> str:
-    return json.dumps({"text": _trim_message_text(text)}, ensure_ascii=False)
-
-
 def _message_reply_uuid(message_id: str) -> str:
     return f"{message_id}-reply"
 
@@ -403,31 +323,10 @@ def _json_lark_md_card_message(text: str) -> str:
     return _json_final_card_data(text)
 
 
-def _card_markdown_text(text: str) -> str:
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    return normalized or FEISHU_PLACEHOLDER_TEXT
-
-
-def _card_summary_text(text: str) -> str:
-    body_text = _card_markdown_text(text)
-    for raw_line in body_text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        plain = re.sub(r"[*`>#]", "", line).strip()
-        if plain:
-            return _trim_text(plain, 60)
-    return FEISHU_PLACEHOLDER_TEXT
-
-
 def _prepare_streaming_preview_text(text: str) -> str:
     if text.count("```") % 2 == 1:
         return f"{text}\n```"
     return text
-
-
-def _json_card_id_message(card_id: str) -> str:
-    return json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False)
 
 
 def _json_final_card_data(text: str) -> str:
@@ -446,37 +345,6 @@ def _json_final_card_data(text: str) -> str:
                         "content": final_text,
                     },
                 }
-            ]
-        },
-    }
-    return json.dumps(card, ensure_ascii=False)
-
-
-def _json_partial_card_data() -> str:
-    card = {
-        "schema": "2.0",
-        "config": {
-            "streaming_mode": True,
-            "width_mode": "fill",
-            "summary": {"content": "[思考中]"},
-            "streaming_config": {
-                "print_frequency_ms": {"default": 25},
-                "print_step": {"default": 1},
-                "print_strategy": "fast",
-            },
-        },
-        "body": {
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": "",
-                    "element_id": FEISHU_PARTIAL_CARD_ELEMENT_ID,
-                },
-                {
-                    "tag": "markdown",
-                    "content": "<text_tag color='green'>思考中</text_tag>",
-                    "element_id": FEISHU_PARTIAL_CARD_STATUS_ELEMENT_ID,
-                },
             ]
         },
     }
@@ -916,52 +784,6 @@ def _extract_stream_text(event_name: str, event: dict[str, Any]) -> tuple[str, b
     return "", False
 
 
-def _reply_text(message: Any, text: str, uuid_suffix: str) -> str:
-    content = _json_text_message(text)
-    reply_uuid = _message_reply_uuid(message.message_id or "")
-
-    def _reply() -> str:
-        response = client.im.v1.message.reply(
-            ReplyMessageRequest.builder()
-            .message_id(message.message_id)
-            .request_body(
-                ReplyMessageRequestBody.builder()
-                .content(content)
-                .msg_type(FEISHU_TEXT_MESSAGE_TYPE)
-                .reply_in_thread(FEISHU_REPLY_IN_THREAD)
-                .uuid(reply_uuid)
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("reply text message", response)
-        return getattr(response.data, "message_id", "") or ""
-
-    try:
-        return _retry_lark_call("reply text message", _reply)
-    except Exception as reply_error:
-        lark.logger.error("reply message failed, fallback to chat create: %s", reply_error, exc_info=True)
-
-    def _create() -> str:
-        response = client.im.v1.message.create(
-            CreateMessageRequest.builder()
-            .receive_id_type("chat_id")
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(message.chat_id)
-                .msg_type(FEISHU_TEXT_MESSAGE_TYPE)
-                .content(content)
-                .uuid(reply_uuid)
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("create text message", response)
-        return getattr(response.data, "message_id", "") or ""
-
-    return _retry_lark_call("create text message", _create)
-
-
 def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
     content = _json_lark_md_card_message(text)
     reply_uuid = _message_reply_uuid(message.message_id or "")
@@ -1008,79 +830,11 @@ def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
     try:
         return _retry_lark_call("create lark_md card message", _create)
     except Exception as create_error:
-        lark.logger.warning("create lark_md card message failed, fallback to text: %s", create_error, exc_info=True)
-
-    return _reply_text(message, text, uuid_suffix)
+        raise FeishuRequestError(f"create lark_md card message failed: {create_error}") from create_error
 
 
 def _reply_user_message(message: Any, text: str, uuid_suffix: str) -> str:
     return _reply_lark_md_card(message, text, uuid_suffix)
-
-
-def _update_text_message(message_id: str, text: str) -> None:
-    content = _json_text_message(text)
-
-    def _update() -> None:
-        response = client.im.v1.message.update(
-            UpdateMessageRequest.builder()
-            .message_id(message_id)
-            .request_body(
-                UpdateMessageRequestBody.builder()
-                .msg_type(FEISHU_TEXT_MESSAGE_TYPE)
-                .content(content)
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("update text message", response)
-
-    _retry_lark_call("update text message", _update)
-
-
-def _create_text_message(chat_id: str, text: str, uuid_suffix: str) -> str:
-    content = _json_text_message(text)
-
-    def _create() -> str:
-        response = client.im.v1.message.create(
-            CreateMessageRequest.builder()
-            .receive_id_type("chat_id")
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(chat_id)
-                .msg_type(FEISHU_TEXT_MESSAGE_TYPE)
-                .content(content)
-                .uuid(uuid_suffix)
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("create text message", response)
-        return getattr(response.data, "message_id", "") or ""
-
-    return _retry_lark_call("create text message", _create)
-
-
-def _create_lark_md_card_message(chat_id: str, text: str, uuid_suffix: str) -> str:
-    content = _json_lark_md_card_message(text)
-
-    def _create() -> str:
-        response = client.im.v1.message.create(
-            CreateMessageRequest.builder()
-            .receive_id_type("chat_id")
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(chat_id)
-                .msg_type(FEISHU_CARD_MESSAGE_TYPE)
-                .content(content)
-                .uuid(uuid_suffix)
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("create lark_md card message", response)
-        return getattr(response.data, "message_id", "") or ""
-
-    return _retry_lark_call("create lark_md card message", _create)
 
 
 def _patch_lark_md_card_message(message_id: str, text: str) -> None:
@@ -1102,212 +856,13 @@ def _patch_lark_md_card_message(message_id: str, text: str) -> None:
     _retry_lark_call("patch lark_md card message", _patch)
 
 
-def _create_partial_card_message() -> str:
-    data = _json_partial_card_data()
-
-    def _create() -> str:
-        response = client.cardkit.v1.card.create(
-            CreateCardRequest.builder()
-            .request_body(
-                CreateCardRequestBody.builder()
-                .type("card_json")
-                .data(data)
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("create partial card", response)
-        return getattr(response.data, "card_id", "") or ""
-
-    return _retry_lark_call("create partial card", _create)
-
-
-def _reply_card_id_message(message: Any, card_id: str, uuid_suffix: str) -> str:
-    content = _json_card_id_message(card_id)
-
-    def _reply() -> str:
-        response = client.im.v1.message.reply(
-            ReplyMessageRequest.builder()
-            .message_id(message.message_id)
-            .request_body(
-                ReplyMessageRequestBody.builder()
-                .content(content)
-                .msg_type(FEISHU_CARD_MESSAGE_TYPE)
-                .reply_in_thread(FEISHU_REPLY_IN_THREAD)
-                .uuid(f"{message.message_id}-{uuid_suffix}")
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("reply card_id message", response)
-        return getattr(response.data, "message_id", "") or ""
-
-    try:
-        return _retry_lark_call("reply card_id message", _reply)
-    except Exception as reply_error:
-        lark.logger.error("reply card_id message failed, fallback to chat create: %s", reply_error, exc_info=True)
-
-    def _create() -> str:
-        response = client.im.v1.message.create(
-            CreateMessageRequest.builder()
-            .receive_id_type("chat_id")
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(message.chat_id)
-                .msg_type(FEISHU_CARD_MESSAGE_TYPE)
-                .content(content)
-                .uuid(f"{message.message_id}-{uuid_suffix}-create")
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("create card_id message", response)
-        return getattr(response.data, "message_id", "") or ""
-
-    return _retry_lark_call("create card_id message", _create)
-
-
-def _create_card_id_message(chat_id: str, card_id: str, uuid_suffix: str) -> str:
-    content = _json_card_id_message(card_id)
-
-    def _create() -> str:
-        response = client.im.v1.message.create(
-            CreateMessageRequest.builder()
-            .receive_id_type("chat_id")
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(chat_id)
-                .msg_type(FEISHU_CARD_MESSAGE_TYPE)
-                .content(content)
-                .uuid(uuid_suffix)
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("create card_id message", response)
-        return getattr(response.data, "message_id", "") or ""
-
-    return _retry_lark_call("create card_id message", _create)
-
-
-def _update_partial_card_text(card_id: str, text: str, sequence: int) -> None:
-    content = _card_markdown_text(text)
-
-    def _update() -> None:
-        response = client.cardkit.v1.card_element.content(
-            ContentCardElementRequest.builder()
-            .card_id(card_id)
-            .element_id(FEISHU_PARTIAL_CARD_ELEMENT_ID)
-            .request_body(
-                ContentCardElementRequestBody.builder()
-                .content(content)
-                .sequence(sequence)
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("update partial card text", response)
-
-    _retry_lark_call("update partial card text", _update)
-
-
-def _finish_partial_card_text(card_id: str, text: str, sequence: int) -> None:
-    final_card_data = _json_final_card_data(text)
-
-    def _finish() -> None:
-        response = client.cardkit.v1.card.update(
-            UpdateCardRequest.builder()
-            .card_id(card_id)
-            .request_body(
-                UpdateCardRequestBody.builder()
-                .card(
-                    Card.builder()
-                    .type("card_json")
-                    .data(final_card_data)
-                    .build()
-                )
-                .sequence(sequence)
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("finish partial card text", response)
-
-    _retry_lark_call("finish partial card text", _finish)
-
-
-def _replace_reply_with_lark_md_card(reply_state: ReplyMessageState, text: str) -> None:
-    old_message_id = reply_state.message_id
-    new_message_id = _create_lark_md_card_message(
-        reply_state.chat_id,
-        text,
-        f"{old_message_id}-card-fallback",
-    )
-    reply_state.message_id = new_message_id
-    reply_state.mode = "final_card"
-    reply_state.card_id = ""
-    lark.logger.warning(
-        "created additional lark_md card without deleting old reply: old_message_id=%s new_message_id=%s",
-        old_message_id,
-        new_message_id,
-    )
-
-
 def _reply_stream_message(message: Any, text: str, uuid_suffix: str) -> ReplyMessageState:
     message_id = _reply_lark_md_card(message, text, f"{uuid_suffix}-final-card")
-    return ReplyMessageState(message_id=message_id, chat_id=message.chat_id, mode="final_card")
-
-
-def _create_additional_partial_card_message(reply_state: ReplyMessageState) -> None:
-    card_id = _create_partial_card_message()
-    if not card_id:
-        raise FeishuRequestError("create additional partial card succeeded but card_id is empty")
-
-    message_id = _create_card_id_message(
-        reply_state.chat_id,
-        card_id,
-        f"{reply_state.message_id}-segment-{reply_state.sequence}",
-    )
-    reply_state.message_id = message_id
-    reply_state.card_id = card_id
-
-
-def _degrade_reply_to_final_card(reply_state: ReplyMessageState) -> None:
-    reply_state.mode = "final_card"
-    reply_state.card_id = ""
+    return ReplyMessageState(message_id=message_id, chat_id=message.chat_id)
 
 
 def _update_reply_message(reply_state: ReplyMessageState, text: str, streaming_mode: bool) -> None:
-    if reply_state.mode == "card":
-        try:
-            if not reply_state.card_id:
-                _create_additional_partial_card_message(reply_state)
-
-            if streaming_mode:
-                _update_partial_card_text(reply_state.card_id, text, reply_state.sequence)
-            else:
-                _finish_partial_card_text(reply_state.card_id, text, reply_state.sequence)
-                reply_state.card_id = ""
-            reply_state.sequence += 1
-            return
-        except Exception as exc:
-            lark.logger.warning(
-                "update partial card message failed, degrade to final lark_md card: message_id=%s err=%s",
-                reply_state.message_id,
-                exc,
-                exc_info=True,
-            )
-            if streaming_mode:
-                _degrade_reply_to_final_card(reply_state)
-            else:
-                _replace_reply_with_lark_md_card(reply_state, text)
-            return
-
-    if reply_state.mode == "final_card":
-        _patch_lark_md_card_message(reply_state.message_id, text)
-        return
-
-    _update_text_message(reply_state.message_id, text)
+    _patch_lark_md_card_message(reply_state.message_id, text)
 
 
 def _add_ack_reaction(message_id: str) -> None:
