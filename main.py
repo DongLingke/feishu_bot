@@ -108,15 +108,15 @@ def _current_build_id() -> str:
 
 def _validate_runtime_config() -> None:
     if config.FEISHU_APP_ID in CONFIG_PLACEHOLDERS:
-        raise BotRuntimeError("请先在 config.py 中配置真实的 FEISHU_APP_ID。")
+        raise BotRuntimeError("请先在 .env 中配置真实的 FEISHU_APP_ID。")
     if config.FEISHU_APP_SECRET in CONFIG_PLACEHOLDERS:
-        raise BotRuntimeError("请先在 config.py 中配置真实的 FEISHU_APP_SECRET。")
+        raise BotRuntimeError("请先在 .env 中配置真实的 FEISHU_APP_SECRET。")
     if config.DIFY_API_KEY in CONFIG_PLACEHOLDERS:
-        raise BotRuntimeError("请先在 config.py 中配置真实的 DIFY_API_KEY。")
+        raise BotRuntimeError("请先在 .env 中配置真实的 DIFY_API_KEY。")
     if "your-dify.example.com" in config.DIFY_API_BASE_URL:
-        raise BotRuntimeError("请先在 config.py 中配置真实的 DIFY_API_BASE_URL。")
+        raise BotRuntimeError("请先在 .env 中配置真实的 DIFY_API_BASE_URL。")
     if "your-dify.example.com" in config.DIFY_APP_PAGE_URL:
-        raise BotRuntimeError("请先在 config.py 中配置真实的 DIFY_APP_PAGE_URL。")
+        raise BotRuntimeError("请先在 .env 中配置真实的 DIFY_APP_PAGE_URL。")
 
 
 def _shutdown_message_executor() -> None:

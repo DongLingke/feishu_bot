@@ -23,7 +23,8 @@
 
 ```text
 .
-├── config.py                  # 项目配置示例
+├── .env.example               # 环境变量模板
+├── config.py                  # 配置加载器（读取 .env / 环境变量）
 ├── main.py                    # 主入口，负责飞书事件与消息编排
 ├── feishu_bot/
 │   ├── errors.py              # 异常定义
@@ -68,7 +69,13 @@ bootstrap.bat
 
 ### 2. 配置参数
 
-先打开 `config.py`，把下面这些占位值换成你自己的配置：
+先复制模板文件：
+
+```bash
+cp .env.example .env
+```
+
+然后打开 `.env`，把下面这些占位值换成你自己的配置：
 
 - `FEISHU_APP_ID`
 - `FEISHU_APP_SECRET`
@@ -78,9 +85,9 @@ bootstrap.bat
 
 默认配置是 Dify Chat API：
 
-```python
-DIFY_APP_TYPE = "chat"
-DIFY_API_PATH = "/chat-messages"
+```env
+DIFY_APP_TYPE=chat
+DIFY_API_PATH=/chat-messages
 ```
 
 ### 3. 启动服务
@@ -143,7 +150,7 @@ Chat 模式下，项目会缓存上游返回的 `conversation_id`，因此同一
 
 ## 当前限制
 
-- 当前配置文件是直接写在仓库里的示例配置，适合快速理解和二次开发；如果你要正式部署，建议改成环境变量或私有配置文件
+- 真实配置应只保存在 `.env` 中，公开仓库里的 `config.py` 和 `.env.example` 都是安全的模板文件
 - 当前默认并发数为 3，如果你的上游后端吞吐更高，可以在代码里调大
 - 当前仓库默认以 Dify Chat 为主，虽然适配器层兼容更多协议，但还没有内置其他后端实现
 

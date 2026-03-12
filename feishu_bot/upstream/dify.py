@@ -92,7 +92,7 @@ class DifyAdapter(UpstreamAdapter):
 
     def stream(self, request: UpstreamRequest) -> Iterator[UpstreamStreamEvent]:
         if not self.api_key:
-            raise DifyRequestError("DIFY_API_KEY is empty", "config.py 中没有配置 Dify API Key")
+            raise DifyRequestError("DIFY_API_KEY is empty", ".env 中没有配置 Dify API Key")
 
         url = self.api_base_url.rstrip("/") + "/" + self.api_path.lstrip("/")
         payload = self.build_request_payload(request)
