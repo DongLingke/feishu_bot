@@ -58,10 +58,30 @@ def _is_markdown_hr(line: str) -> bool:
     return bool(re.match(r"^\s*([-*_])\1{2,}\s*$", line.strip()))
 
 
+def _soften_heading_sizes(content: str) -> str:
+    """把较大的 Markdown 标题降一级，避免飞书里视觉过重。"""
+    lines = content.split("\n")
+    softened_lines: list[str] = []
+
+    for raw_line in lines:
+        line = raw_line.rstrip("\r")
+        stripped = line.strip()
+        heading_match = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        if not heading_match:
+            softened_lines.append(line)
+            continue
+
+        title = heading_match.group(2).strip()
+        softened_lines.append(f"**{title}**" if title else "")
+
+    return "\n".join(softened_lines)
+
+
 def _flush_markdown_block(elements: list[dict[str, Any]], lines: list[str]) -> None:
     content = "\n".join(lines).strip()
     if not content:
         return
+    content = _soften_heading_sizes(content)
     elements.append(
         {
             "tag": "div",
