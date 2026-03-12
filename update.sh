@@ -33,8 +33,12 @@ fi
 
 cd "$PROJECT_DIR"
 
-current_branch="$(git branch --show-current)"
-if [[ -z "$current_branch" ]]; then
+current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+if [[ -z "$current_branch" || "$current_branch" == "HEAD" ]]; then
+    current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+fi
+
+if [[ -z "$current_branch" || "$current_branch" == "HEAD" ]]; then
     echo "cannot determine current git branch."
     exit 1
 fi

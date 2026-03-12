@@ -288,6 +288,55 @@ def _trim_message_text(text: str) -> str:
     return text[:allowed] + suffix
 
 
+def _normalize_lark_md(text: str) -> str:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    normalized_lines: list[str] = []
+    in_code_block = False
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+
+        if line.startswith("```"):
+            in_code_block = not in_code_block
+            normalized_lines.append(line)
+            continue
+
+        if in_code_block:
+            normalized_lines.append(line)
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if heading_match:
+            title = heading_match.group(2).strip()
+            normalized_lines.append(f"**{title}**" if title else "")
+            continue
+
+        bullet_match = re.match(r"^(\s*)[-*+]\s+(.+)$", line)
+        if bullet_match:
+            indent = bullet_match.group(1)
+            item = bullet_match.group(2).strip()
+            normalized_lines.append(f"{indent}• {item}" if item else "")
+            continue
+
+        ordered_match = re.match(r"^(\s*)(\d+)\.\s+(.+)$", line)
+        if ordered_match:
+            indent = ordered_match.group(1)
+            index = ordered_match.group(2)
+            item = ordered_match.group(3).strip()
+            normalized_lines.append(f"{indent}{index}. {item}" if item else "")
+            continue
+
+        if re.match(r"^\s*([-*_])\1{2,}\s*$", line):
+            normalized_lines.append("----------")
+            continue
+
+        normalized_lines.append(line)
+
+    normalized_text = "\n".join(normalized_lines)
+    normalized_text = re.sub(r"\n{3,}", "\n\n", normalized_text).strip()
+    return normalized_text
+
+
 def _json_text_message(text: str) -> str:
     return json.dumps({"text": _trim_message_text(text)}, ensure_ascii=False)
 
@@ -320,6 +369,7 @@ def _json_card_id_message(card_id: str) -> str:
 
 
 def _json_final_card_data(text: str) -> str:
+    final_text = _trim_message_text(_normalize_lark_md(text))
     card = {
         "schema": "2.0",
         "config": {
@@ -328,8 +378,11 @@ def _json_final_card_data(text: str) -> str:
         "body": {
             "elements": [
                 {
-                    "tag": "markdown",
-                    "content": _card_markdown_text(text),
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": final_text,
+                    },
                 }
             ]
         },
