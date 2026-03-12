@@ -41,9 +41,10 @@ def normalize_lark_md(text: str) -> str:
             return
         if normalized_lines and normalized_lines[-1] != "":
             normalized_lines.append("")
-        normalized_lines.append("<note>")
-        normalized_lines.extend(quote_lines)
-        normalized_lines.append("</note>")
+        quoted_text = "\n".join(line.strip() for line in quote_lines if line.strip())
+        if quoted_text:
+            quoted_text = quoted_text.strip().strip('"').strip("“").strip("”").strip()
+            normalized_lines.append(f"「{quoted_text}」")
         normalized_lines.append("")
         quote_lines = []
 
@@ -52,7 +53,7 @@ def normalize_lark_md(text: str) -> str:
             normalized_lines.append("")
 
     for raw_line in lines:
-        line = raw_line.rstrip("\r")
+        line = raw_line.rstrip()
         stripped = line.strip()
 
         if stripped.startswith("```"):
@@ -99,11 +100,10 @@ def normalize_lark_md(text: str) -> str:
 
         if re.match(r"^\s*([-*_])\1{2,}\s*$", stripped):
             ensure_blank_line()
-            normalized_lines.append("---")
             normalized_lines.append("")
             continue
 
-        normalized_lines.append(raw_line)
+        normalized_lines.append(line)
 
     flush_quote_lines()
 
