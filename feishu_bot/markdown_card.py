@@ -23,49 +23,89 @@ def trim_message_text(text: str, max_chars: int) -> str:
 
 
 def normalize_lark_md(text: str) -> str:
-    """将常见 Markdown 语法调整为飞书 lark_md 更稳定的写法。"""
+    """
+    将 Markdown 调整成更适合飞书 lark_md 的写法。
+
+    处理原则：
+    1. 尽量保留原始 Markdown，避免把本来能渲染的语法改坏。
+    2. 只对飞书已知不稳定的部分做兼容处理。
+    """
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     normalized_lines: list[str] = []
+    quote_lines: list[str] = []
     in_code_block = False
 
-    for raw_line in lines:
-        line = raw_line.rstrip()
+    def flush_quote_lines() -> None:
+        nonlocal quote_lines
+        if not quote_lines:
+            return
+        if normalized_lines and normalized_lines[-1] != "":
+            normalized_lines.append("")
+        normalized_lines.append("<note>")
+        normalized_lines.extend(quote_lines)
+        normalized_lines.append("</note>")
+        normalized_lines.append("")
+        quote_lines = []
 
-        if line.startswith("```"):
+    def ensure_blank_line() -> None:
+        if normalized_lines and normalized_lines[-1] != "":
+            normalized_lines.append("")
+
+    for raw_line in lines:
+        line = raw_line.rstrip("\r")
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            flush_quote_lines()
+            normalized_lines.append(stripped)
             in_code_block = not in_code_block
-            normalized_lines.append(line)
             continue
 
         if in_code_block:
-            normalized_lines.append(line)
+            normalized_lines.append(raw_line)
             continue
 
-        heading_match = re.match(r"^(#{1,6})\s+(.+)$", line)
+        quote_match = re.match(r"^\s*>\s?(.*)$", line)
+        if quote_match:
+            quote_lines.append(quote_match.group(1))
+            continue
+
+        flush_quote_lines()
+
+        heading_match = re.match(r"^(#{1,6})\s+(.+)$", stripped)
         if heading_match:
+            level = len(heading_match.group(1))
             title = heading_match.group(2).strip()
-            normalized_lines.append(f"**{title}**" if title else "")
+            ensure_blank_line()
+            if level <= 2:
+                normalized_lines.append(f"{'#' * level} {title}")
+            else:
+                normalized_lines.append(f"**{title}**" if title else "")
+            normalized_lines.append("")
             continue
 
-        bullet_match = re.match(r"^(\s*)[-*+]\s+(.+)$", line)
+        bullet_match = re.match(r"^\s*[-*+]\s+(.+)$", line)
         if bullet_match:
-            indent = bullet_match.group(1)
-            item = bullet_match.group(2).strip()
-            normalized_lines.append(f"{indent}• {item}" if item else "")
+            item = bullet_match.group(1).strip()
+            normalized_lines.append(f"- {item}" if item else "")
             continue
 
-        ordered_match = re.match(r"^(\s*)(\d+)\.\s+(.+)$", line)
+        ordered_match = re.match(r"^\s*(\d+)\.\s+(.+)$", line)
         if ordered_match:
-            indent = ordered_match.group(1)
-            index = ordered_match.group(2)
-            item = ordered_match.group(3).strip()
-            normalized_lines.append(f"{indent}{index}. {item}" if item else "")
+            index = ordered_match.group(1)
+            item = ordered_match.group(2).strip()
+            normalized_lines.append(f"{index}. {item}" if item else "")
             continue
 
-        if re.match(r"^\s*([-*_])\1{2,}\s*$", line):
-            normalized_lines.append("----------")
+        if re.match(r"^\s*([-*_])\1{2,}\s*$", stripped):
+            ensure_blank_line()
+            normalized_lines.append("---")
+            normalized_lines.append("")
             continue
 
-        normalized_lines.append(line)
+        normalized_lines.append(raw_line)
+
+    flush_quote_lines()
 
     normalized_text = "\n".join(normalized_lines)
     normalized_text = re.sub(r"\n{3,}", "\n\n", normalized_text).strip()
