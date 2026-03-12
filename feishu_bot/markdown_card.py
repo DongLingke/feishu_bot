@@ -54,6 +54,73 @@ def normalize_lark_md(text: str) -> str:
     return normalized_text
 
 
+def _is_markdown_hr(line: str) -> bool:
+    return bool(re.match(r"^\s*([-*_])\1{2,}\s*$", line.strip()))
+
+
+def _flush_markdown_block(elements: list[dict[str, Any]], lines: list[str]) -> None:
+    content = "\n".join(lines).strip()
+    if not content:
+        return
+    elements.append(
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": content,
+            },
+        }
+    )
+
+
+def build_lark_md_card_elements(text: str) -> list[dict[str, Any]]:
+    """
+    构造更贴近原始 Markdown 结构的卡片元素。
+
+    这里尽量保留原始段落，只把 Markdown 分隔线转换成真实卡片分隔线，
+    避免所有内容挤在一个大块里，导致版式和原始样式偏差太大。
+    """
+    lines = normalize_lark_md(text).split("\n")
+    elements: list[dict[str, Any]] = []
+    current_block: list[str] = []
+
+    for raw_line in lines:
+        line = raw_line.rstrip("\r")
+        stripped = line.strip()
+
+        if _is_markdown_hr(stripped):
+            _flush_markdown_block(elements, current_block)
+            current_block = []
+            if elements and elements[-1].get("tag") != "hr":
+                elements.append({"tag": "hr"})
+            continue
+
+        if stripped == "":
+            if current_block and current_block[-1] != "":
+                current_block.append("")
+            continue
+
+        current_block.append(line)
+
+    _flush_markdown_block(elements, current_block)
+
+    if elements and elements[-1].get("tag") == "hr":
+        elements.pop()
+
+    if not elements:
+        elements.append(
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "",
+                },
+            }
+        )
+
+    return elements
+
+
 def prepare_streaming_preview_text(text: str) -> str:
     """流式中途若代码块未闭合，则临时补齐结束符。"""
     if text.count("```") % 2 == 1:
@@ -70,15 +137,7 @@ def build_lark_md_card_json(text: str, max_chars: int) -> str:
             "width_mode": "fill",
         },
         "body": {
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": final_text,
-                    },
-                }
-            ]
+            "elements": build_lark_md_card_elements(final_text)
         },
     }
     return json.dumps(card, ensure_ascii=False)
