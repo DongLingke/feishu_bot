@@ -447,6 +447,34 @@ def _format_finished_status(data: dict[str, Any]) -> str:
     return ", ".join(pieces)
 
 
+def _merge_stream_text(current_text: str, chunk_text: str, replace_text: bool) -> tuple[str, bool]:
+    """
+    合并上游返回的流式文本。
+
+    某些上游在流式阶段会先返回增量片段，结束前又补发一次完整答案。
+    如果直接追加，会导致同一条回复内容被重复拼接。
+    """
+    if not chunk_text:
+        return current_text, False
+
+    if replace_text or not current_text:
+        return chunk_text, chunk_text != current_text
+
+    if chunk_text == current_text:
+        return current_text, False
+
+    if chunk_text.startswith(current_text):
+        return chunk_text, True
+
+    if chunk_text.endswith(current_text) and len(chunk_text) > len(current_text):
+        return chunk_text, True
+
+    if current_text.endswith(chunk_text) and len(chunk_text) >= max(64, len(current_text) // 2):
+        return current_text, False
+
+    return current_text + chunk_text, True
+
+
 def _reply_lark_md_card(message: Any, text: str) -> str:
     content = _json_lark_md_card_message(text)
     reply_uuid = _message_reply_uuid(message.message_id or "")
@@ -564,10 +592,17 @@ def _stream_dify_to_message(
             chunk_text = upstream_event.text
             replace_text = upstream_event.replace_text
             if chunk_text:
-                if replace_text:
-                    accumulated_text = chunk_text
-                else:
-                    accumulated_text += chunk_text
+                merged_text, changed = _merge_stream_text(accumulated_text, chunk_text, replace_text)
+                if not changed:
+                    lark.logger.info(
+                        "skip duplicated upstream chunk: event=%s reply_message_id=%s chunk_len=%s total_len=%s",
+                        event_name,
+                        reply_state_holder.get("state").message_id if reply_state_holder.get("state") else "pending",
+                        len(chunk_text),
+                        len(accumulated_text),
+                    )
+                    continue
+                accumulated_text = merged_text
                 reply_state = ensure_reply_state(accumulated_text)
                 lark.logger.info(
                     "stream chunk received: reply_message_id=%s chunk_len=%s total_len=%s replace=%s",
@@ -582,7 +617,7 @@ def _stream_dify_to_message(
 
             if upstream_event.finished:
                 stream_finished = True
-                final_text = accumulated_text or FEISHU_EMPTY_RESULT_TEXT
+                final_text = accumulated_text or upstream_event.text or FEISHU_EMPTY_RESULT_TEXT
                 raw_event = upstream_event.raw_event or {}
                 finished_data = raw_event.get("data") if isinstance(raw_event.get("data"), dict) else raw_event
                 if event_name == "workflow_finished" and upstream_event.finish_status != "succeeded":
