@@ -49,9 +49,7 @@ def normalize_lark_md(text: str) -> str:
 
         normalized_lines.append(line)
 
-    normalized_text = "\n".join(normalized_lines)
-    normalized_text = re.sub(r"\n{4,}", "\n\n\n", normalized_text).strip("\n")
-    return normalized_text
+    return "\n".join(normalized_lines)
 
 
 def _is_markdown_hr(line: str) -> bool:
@@ -78,8 +76,8 @@ def _soften_heading_sizes(content: str) -> str:
 
 
 def _flush_markdown_block(elements: list[dict[str, Any]], lines: list[str]) -> None:
-    content = "\n".join(lines).strip()
-    if not content:
+    content = "\n".join(lines)
+    if not content.strip():
         return
     content = _soften_heading_sizes(content)
     elements.append(
@@ -116,7 +114,7 @@ def build_lark_md_card_elements(text: str) -> list[dict[str, Any]]:
             continue
 
         if stripped == "":
-            if current_block and current_block[-1] != "":
+            if current_block:
                 current_block.append("")
             continue
 
