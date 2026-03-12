@@ -8,14 +8,12 @@ import os
 import queue
 import re
 import subprocess
-import sys
 import threading
 import time
 import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
@@ -56,11 +54,6 @@ FEISHU_EMPTY_RESULT_TEXT = "工作流已结束，但没有返回可展示的文�
 FEISHU_MAX_MESSAGE_CHARS = 28000
 FEISHU_CARD_MESSAGE_TYPE = "interactive"
 
-LOCAL_DIFY_MOCK_HOST = "127.0.0.1"
-LOCAL_DIFY_MOCK_PORT = 18080
-LOCAL_DIFY_MOCK_BASE_URL = f"http://{LOCAL_DIFY_MOCK_HOST}:{LOCAL_DIFY_MOCK_PORT}"
-LOCAL_DIFY_MOCK_HEALTH_URL = f"{LOCAL_DIFY_MOCK_BASE_URL}/healthz"
-
 MESSAGE_MAX_AGE_MS = 120000
 MESSAGE_CACHE_SIZE = 1000
 STREAM_QUEUE_MIN_CHARS = 10
@@ -75,7 +68,6 @@ RESET_CONTEXT_COMMANDS = {"/reset", "/new", "/clear", "清空上下文", "重置
 
 PROCESSED_MESSAGES: "OrderedDict[str, float]" = OrderedDict()
 PROCESSED_MESSAGES_LOCK = threading.Lock()
-LOCAL_MOCK_PROCESS: subprocess.Popen[Any] | None = None
 MESSAGE_EXECUTOR = ThreadPoolExecutor(max_workers=MESSAGE_WORKER_COUNT, thread_name_prefix="message-worker")
 MESSAGE_FUTURES: set[Future[Any]] = set()
 MESSAGE_FUTURES_LOCK = threading.Lock()
@@ -282,75 +274,6 @@ def _response_detail(response: Any) -> str:
 
 def _is_message_edit_limit_error(exc: Exception) -> bool:
     return isinstance(exc, FeishuRequestError) and exc.code == "230072"
-
-
-def _is_local_mock_target() -> bool:
-    parsed = urlparse(config.DIFY_API_BASE_URL)
-    return parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port == LOCAL_DIFY_MOCK_PORT
-
-
-def _probe_local_mock() -> bool:
-    request = urllib.request.Request(LOCAL_DIFY_MOCK_HEALTH_URL, method="GET")
-    try:
-        with urllib.request.urlopen(request, timeout=1.5) as response:
-            return 200 <= getattr(response, "status", 0) < 300
-    except Exception:
-        return False
-
-
-def _stop_local_mock() -> None:
-    global LOCAL_MOCK_PROCESS
-    if LOCAL_MOCK_PROCESS is None:
-        return
-    if LOCAL_MOCK_PROCESS.poll() is None:
-        LOCAL_MOCK_PROCESS.terminate()
-        try:
-            LOCAL_MOCK_PROCESS.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            LOCAL_MOCK_PROCESS.kill()
-            LOCAL_MOCK_PROCESS.wait(timeout=3)
-    LOCAL_MOCK_PROCESS = None
-
-
-def _ensure_local_mock_running() -> None:
-    global LOCAL_MOCK_PROCESS
-
-    if not config.USE_LOCAL_DIFY_MOCK or not config.AUTO_START_LOCAL_DIFY_MOCK:
-        return
-    if not _is_local_mock_target():
-        return
-    if _probe_local_mock():
-        return
-    if LOCAL_MOCK_PROCESS is not None and LOCAL_MOCK_PROCESS.poll() is None:
-        return
-
-    mock_script = os.path.join(os.path.dirname(__file__), "mock_dify_server.py")
-    env = os.environ.copy()
-    env.setdefault("MOCK_DIFY_HOST", LOCAL_DIFY_MOCK_HOST)
-    env.setdefault("MOCK_DIFY_PORT", str(LOCAL_DIFY_MOCK_PORT))
-    env.setdefault("MOCK_DIFY_REQUIRE_AUTH", "true")
-
-    lark.logger.info(
-        "local mock dify is not running, starting %s on %s",
-        mock_script,
-        LOCAL_DIFY_MOCK_BASE_URL,
-    )
-    LOCAL_MOCK_PROCESS = subprocess.Popen(
-        [sys.executable, mock_script],
-        env=env,
-        cwd=os.path.dirname(__file__),
-    )
-
-    for _ in range(20):
-        if _probe_local_mock():
-            atexit.register(_stop_local_mock)
-            lark.logger.info("local mock dify is ready: %s", LOCAL_DIFY_MOCK_BASE_URL)
-            return
-        if LOCAL_MOCK_PROCESS.poll() is not None:
-            break
-        time.sleep(0.25)
-
-    raise BotRuntimeError(f"failed to start local mock dify at {LOCAL_DIFY_MOCK_BASE_URL}")
 
 
 def _acquire_instance_lock() -> None:
@@ -842,16 +765,6 @@ ws_client = lark.ws.Client(
 
 def main() -> None:
     _acquire_instance_lock()
-    _ensure_local_mock_running()
-    if (
-        config.TEST_CONFIG["feishu_app_id"] == config.ONLINE_CONFIG["feishu_app_id"]
-        and config.TEST_CONFIG["feishu_app_secret"] == config.ONLINE_CONFIG["feishu_app_secret"]
-    ):
-        raise BotRuntimeError(
-            "TEST 和 ONLINE 不能共用同一个飞书应用。"
-            "请为测试环境和正式环境配置不同的 feishu_app_id / feishu_app_secret，"
-            "否则无法保证不会重复消费同一条消息。"
-        )
     lark.logger.info("bot build id: %s", _current_build_id())
     lark.logger.info("starting Feishu bot with dify page %s", config.DIFY_APP_PAGE_URL)
     ws_client.start()
