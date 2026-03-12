@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 from concurrent.futures import Future, ThreadPoolExecutor
+import contextlib
 import json
 import os
 import queue
@@ -47,6 +48,11 @@ from lark_oapi.api.im.v1 import (
 
 import config
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+
 
 TEXT_MENTION_PATTERN = re.compile(r"@_user_\d+\s*")
 FEISHU_REPLY_IN_THREAD = False
@@ -81,6 +87,8 @@ LOCAL_MOCK_PROCESS: subprocess.Popen[Any] | None = None
 MESSAGE_EXECUTOR = ThreadPoolExecutor(max_workers=MESSAGE_WORKER_COUNT, thread_name_prefix="message-worker")
 MESSAGE_FUTURES: set[Future[Any]] = set()
 MESSAGE_FUTURES_LOCK = threading.Lock()
+INSTANCE_LOCK_FILE = os.path.join(os.path.dirname(__file__), "bot.lock")
+INSTANCE_LOCK_HANDLE: Any | None = None
 
 
 def _shutdown_message_executor() -> None:
@@ -90,7 +98,20 @@ def _shutdown_message_executor() -> None:
         pass
 
 
+def _release_instance_lock() -> None:
+    global INSTANCE_LOCK_HANDLE
+    if INSTANCE_LOCK_HANDLE is None:
+        return
+    if fcntl is not None:
+        with contextlib.suppress(Exception):
+            fcntl.flock(INSTANCE_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+    with contextlib.suppress(Exception):
+        INSTANCE_LOCK_HANDLE.close()
+    INSTANCE_LOCK_HANDLE = None
+
+
 atexit.register(_shutdown_message_executor)
+atexit.register(_release_instance_lock)
 
 
 class BotRuntimeError(Exception):
@@ -540,6 +561,29 @@ def _ensure_local_mock_running() -> None:
         time.sleep(0.25)
 
     raise BotRuntimeError(f"failed to start local mock dify at {LOCAL_DIFY_MOCK_BASE_URL}")
+
+
+def _acquire_instance_lock() -> None:
+    global INSTANCE_LOCK_HANDLE
+    if INSTANCE_LOCK_HANDLE is not None:
+        return
+
+    lock_handle = open(INSTANCE_LOCK_FILE, "a+", encoding="utf-8")
+    if fcntl is None:
+        INSTANCE_LOCK_HANDLE = lock_handle
+        return
+
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock_handle.close()
+        raise BotRuntimeError(f"another bot instance is already running: {INSTANCE_LOCK_FILE}") from exc
+
+    lock_handle.seek(0)
+    lock_handle.truncate()
+    lock_handle.write(f"pid={os.getpid()}\n")
+    lock_handle.flush()
+    INSTANCE_LOCK_HANDLE = lock_handle
 
 
 def _raise_for_lark_failure(action: str, response: Any) -> Any:
@@ -1530,6 +1574,7 @@ ws_client = lark.ws.Client(
 
 
 def main() -> None:
+    _acquire_instance_lock()
     _ensure_local_mock_running()
     lark.logger.info("starting Feishu bot with dify page %s", config.DIFY_APP_PAGE_URL)
     ws_client.start()
