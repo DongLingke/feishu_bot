@@ -63,6 +63,8 @@ API_RETRY_BASE_SECONDS = 1.0
 MAX_ERROR_BODY_CHARS = 1500
 PREFERRED_OUTPUT_KEYS = ("answer", "text", "output", "result", "final_text")
 MESSAGE_WORKER_COUNT = 3
+CONVERSATION_CACHE_SIZE = 1000
+RESET_CONTEXT_COMMANDS = {"/reset", "/new", "/clear", "清空上下文", "重置上下文", "新建会话"}
 
 PROCESSED_MESSAGES: "OrderedDict[str, float]" = OrderedDict()
 PROCESSED_MESSAGES_LOCK = threading.Lock()
@@ -72,6 +74,8 @@ MESSAGE_FUTURES: set[Future[Any]] = set()
 MESSAGE_FUTURES_LOCK = threading.Lock()
 INSTANCE_LOCK_FILE = os.path.join(os.path.dirname(__file__), "bot.lock")
 INSTANCE_LOCK_HANDLE: Any | None = None
+CONVERSATION_CACHE: "OrderedDict[str, str]" = OrderedDict()
+CONVERSATION_CACHE_LOCK = threading.Lock()
 
 
 def _current_build_id() -> str:
@@ -551,6 +555,34 @@ def _sender_user_id(data: P2ImMessageReceiveV1) -> str:
     return "unknown-user"
 
 
+def _conversation_session_key(message: Any, user_identifier: str) -> str:
+    chat_id = getattr(message, "chat_id", "") or "unknown-chat"
+    return f"{chat_id}:{user_identifier}"
+
+
+def _get_conversation_id(session_key: str) -> str:
+    with CONVERSATION_CACHE_LOCK:
+        conversation_id = CONVERSATION_CACHE.get(session_key, "")
+        if conversation_id:
+            CONVERSATION_CACHE.move_to_end(session_key)
+        return conversation_id
+
+
+def _set_conversation_id(session_key: str, conversation_id: str) -> None:
+    if not conversation_id:
+        return
+    with CONVERSATION_CACHE_LOCK:
+        CONVERSATION_CACHE[session_key] = conversation_id
+        CONVERSATION_CACHE.move_to_end(session_key)
+        while len(CONVERSATION_CACHE) > CONVERSATION_CACHE_SIZE:
+            CONVERSATION_CACHE.popitem(last=False)
+
+
+def _clear_conversation_id(session_key: str) -> bool:
+    with CONVERSATION_CACHE_LOCK:
+        return CONVERSATION_CACHE.pop(session_key, None) is not None
+
+
 def _build_workflow_inputs(query: str) -> dict[str, object]:
     inputs: dict[str, object] = dict(config.DIFY_FIXED_INPUTS)
     for key in config.DIFY_QUERY_INPUT_KEYS:
@@ -562,14 +594,17 @@ def _dify_app_type() -> str:
     return str(config.DIFY_APP_TYPE or "workflow").strip().lower()
 
 
-def _build_dify_request_body(query: str, user_identifier: str) -> dict[str, object]:
+def _build_dify_request_body(query: str, user_identifier: str, conversation_id: str = "") -> dict[str, object]:
     if _dify_app_type() == "chat":
-        return {
+        body: dict[str, object] = {
             "inputs": dict(config.DIFY_FIXED_INPUTS),
             "query": query,
             "response_mode": "streaming",
             "user": user_identifier,
         }
+        if conversation_id:
+            body["conversation_id"] = conversation_id
+        return body
 
     return {
         "inputs": _build_workflow_inputs(query),
@@ -670,7 +705,7 @@ def _extract_best_output_text(outputs: Any) -> str:
     return ""
 
 
-def _dify_stream(query: str, user_identifier: str) -> Any:
+def _dify_stream(query: str, user_identifier: str, conversation_id: str = "") -> Any:
     app_type = _dify_app_type()
     if not config.DIFY_API_KEY:
         raise DifyRequestError(
@@ -679,7 +714,7 @@ def _dify_stream(query: str, user_identifier: str) -> Any:
         )
 
     url = config.DIFY_API_BASE_URL.rstrip("/") + "/" + config.DIFY_API_PATH.lstrip("/")
-    request_body = _build_dify_request_body(query, user_identifier)
+    request_body = _build_dify_request_body(query, user_identifier, conversation_id)
     encoded_body = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -775,6 +810,20 @@ def _extract_chat_event_text(event: dict[str, Any]) -> str:
     text = _extract_best_output_text(outputs)
     if text:
         return text
+
+    return ""
+
+
+def _extract_event_conversation_id(event: dict[str, Any]) -> str:
+    value = event.get("conversation_id")
+    if isinstance(value, str) and value:
+        return value
+
+    data = event.get("data")
+    if isinstance(data, dict):
+        nested_value = data.get("conversation_id")
+        if isinstance(nested_value, str) and nested_value:
+            return nested_value
 
     return ""
 
@@ -877,6 +926,7 @@ def _stream_dify_to_message(
     reply_state: ReplyMessageState,
     query: str,
     user_identifier: str,
+    session_key: str,
     extra_notice: str = "",
 ) -> None:
     app_type = _dify_app_type()
@@ -884,11 +934,18 @@ def _stream_dify_to_message(
     stream_finished = False
     stream_sender = FeishuStreamSender(reply_state)
     stream_sender.start()
+    current_conversation_id = _get_conversation_id(session_key) if app_type == "chat" else ""
 
     try:
-        for event in _dify_stream(query, user_identifier):
+        for event in _dify_stream(query, user_identifier, current_conversation_id):
             event_name = str(event.get("event") or "")
             lark.logger.debug("dify stream event: %s", event_name or event)
+
+            new_conversation_id = _extract_event_conversation_id(event)
+            if app_type == "chat" and new_conversation_id and new_conversation_id != current_conversation_id:
+                current_conversation_id = new_conversation_id
+                _set_conversation_id(session_key, current_conversation_id)
+                lark.logger.info("dify conversation updated: session=%s conversation_id=%s", session_key, current_conversation_id)
 
             if event_name == "error":
                 raise DifyRequestError(f"Dify {app_type} stream error", _format_stream_error_event(event))
@@ -1030,17 +1087,29 @@ def _handle_received_message(data: P2ImMessageReceiveV1) -> None:
         _reply_user_message(message, text, "empty")
         return
 
+    user_identifier = _sender_user_id(data)
+    session_key = _conversation_session_key(message, user_identifier)
+
+    if _dify_app_type() == "chat" and query.strip() in RESET_CONTEXT_COMMANDS:
+        existed = _clear_conversation_id(session_key)
+        reset_text = "已清空当前会话上下文。接下来我会从新的对话开始回答。"
+        if not existed:
+            reset_text = "当前没有可清空的会话上下文。接下来我会从新的对话开始回答。"
+        if reaction_error:
+            reset_text += f"\n\n[提示] 表情回复失败: {_trim_text(reaction_error, 300)}"
+        _reply_user_message(message, reset_text, "reset-context")
+        return
+
     reply_state = _reply_stream_message(message, FEISHU_PLACEHOLDER_TEXT, "placeholder")
     if not reply_state.message_id:
         raise FeishuRequestError("placeholder message created but message_id is empty")
-
-    user_identifier = _sender_user_id(data)
 
     try:
         _stream_dify_to_message(
             reply_state,
             query,
             user_identifier,
+            session_key,
             reaction_error,
         )
     except DifyRequestError as exc:

@@ -240,6 +240,8 @@ class MockDifyHandler(BaseHTTPRequestHandler):
 
         query = str(payload.get("query") or "")
         user = str(payload.get("user") or "mock-user")
+        conversation_id = str(payload.get("conversation_id") or uuid.uuid4())
+        message_id = str(uuid.uuid4())
         scenario, scenario_query = _scenario_from_query(query)
         visible_query = scenario_query if scenario != "default" else query
         answer_text = _build_answer_text(visible_query, user, payload.get("inputs") or {}, scenario)
@@ -250,6 +252,8 @@ class MockDifyHandler(BaseHTTPRequestHandler):
                 "message",
                 {
                     "event": "message",
+                    "conversation_id": conversation_id,
+                    "message_id": message_id,
                     "data": {
                         "outputs": {
                             "answer": chunk,
@@ -263,6 +267,8 @@ class MockDifyHandler(BaseHTTPRequestHandler):
             "message_end",
             {
                 "event": "message_end",
+                "conversation_id": conversation_id,
+                "message_id": message_id,
                 "data": {
                     "outputs": {
                         "answer": answer_text,
