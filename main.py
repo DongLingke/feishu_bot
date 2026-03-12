@@ -37,6 +37,8 @@ from lark_oapi.api.im.v1 import (
     P2ImMessageMessageReadV1,
     P2ImMessageReceiveV1,
     P2ImMessageReactionCreatedV1,
+    PatchMessageRequest,
+    PatchMessageRequestBody,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
     UpdateMessageRequest,
@@ -231,8 +233,17 @@ class FeishuStreamSender:
 
     def _finish_message(self, text: str) -> None:
         if self.reply_state.mode == "card" and self.reply_state.card_id:
-            _finish_partial_card_text(self.reply_state.card_id, text, self.reply_state.sequence)
-            self.reply_state.sequence += 1
+            try:
+                _patch_lark_md_card_message(self.reply_state.message_id, text)
+            except Exception as exc:
+                lark.logger.warning(
+                    "patch final lark_md card failed, fallback to cardkit final update: message_id=%s err=%s",
+                    self.reply_state.message_id,
+                    exc,
+                    exc_info=True,
+                )
+                _finish_partial_card_text(self.reply_state.card_id, text, self.reply_state.sequence)
+                self.reply_state.sequence += 1
             self.reply_state.card_id = ""
             return
 
@@ -975,6 +986,25 @@ def _create_lark_md_card_message(chat_id: str, text: str, uuid_suffix: str) -> s
         return getattr(response.data, "message_id", "") or ""
 
     return _retry_lark_call("create lark_md card message", _create)
+
+
+def _patch_lark_md_card_message(message_id: str, text: str) -> None:
+    content = _json_lark_md_card_message(text)
+
+    def _patch() -> None:
+        response = client.im.v1.message.patch(
+            PatchMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                PatchMessageRequestBody.builder()
+                .content(content)
+                .build()
+            )
+            .build()
+        )
+        _raise_for_lark_failure("patch lark_md card message", response)
+
+    _retry_lark_call("patch lark_md card message", _patch)
 
 
 def _create_partial_card_message() -> str:
