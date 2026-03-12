@@ -341,6 +341,10 @@ def _json_text_message(text: str) -> str:
     return json.dumps({"text": _trim_message_text(text)}, ensure_ascii=False)
 
 
+def _json_lark_md_card_message(text: str) -> str:
+    return _json_final_card_data(text)
+
+
 def _card_markdown_text(text: str) -> str:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     return normalized or FEISHU_PLACEHOLDER_TEXT
@@ -876,6 +880,37 @@ def _reply_text(message: Any, text: str, uuid_suffix: str) -> str:
     return _retry_lark_call("create text message", _create)
 
 
+def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
+    content = _json_lark_md_card_message(text)
+
+    def _reply() -> str:
+        response = client.im.v1.message.reply(
+            ReplyMessageRequest.builder()
+            .message_id(message.message_id)
+            .request_body(
+                ReplyMessageRequestBody.builder()
+                .content(content)
+                .msg_type(FEISHU_CARD_MESSAGE_TYPE)
+                .reply_in_thread(FEISHU_REPLY_IN_THREAD)
+                .uuid(f"{message.message_id}-{uuid_suffix}")
+                .build()
+            )
+            .build()
+        )
+        _raise_for_lark_failure("reply lark_md card message", response)
+        return getattr(response.data, "message_id", "") or ""
+
+    try:
+        return _retry_lark_call("reply lark_md card message", _reply)
+    except Exception as reply_error:
+        lark.logger.warning("reply lark_md card message failed, fallback to text: %s", reply_error, exc_info=True)
+        return _reply_text(message, text, f"{uuid_suffix}-text-fallback")
+
+
+def _reply_user_message(message: Any, text: str, uuid_suffix: str) -> str:
+    return _reply_lark_md_card(message, text, uuid_suffix)
+
+
 def _update_text_message(message_id: str, text: str) -> None:
     content = _json_text_message(text)
 
@@ -917,6 +952,29 @@ def _create_text_message(chat_id: str, text: str, uuid_suffix: str) -> str:
         return getattr(response.data, "message_id", "") or ""
 
     return _retry_lark_call("create text message", _create)
+
+
+def _create_lark_md_card_message(chat_id: str, text: str, uuid_suffix: str) -> str:
+    content = _json_lark_md_card_message(text)
+
+    def _create() -> str:
+        response = client.im.v1.message.create(
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type(FEISHU_CARD_MESSAGE_TYPE)
+                .content(content)
+                .uuid(uuid_suffix)
+                .build()
+            )
+            .build()
+        )
+        _raise_for_lark_failure("create lark_md card message", response)
+        return getattr(response.data, "message_id", "") or ""
+
+    return _retry_lark_call("create lark_md card message", _create)
 
 
 def _create_partial_card_message() -> str:
@@ -1069,6 +1127,22 @@ def _switch_reply_to_text(reply_state: ReplyMessageState, text: str) -> None:
         lark.logger.warning("delete card message after text fallback failed: message_id=%s err=%s", old_message_id, exc)
 
 
+def _replace_reply_with_lark_md_card(reply_state: ReplyMessageState, text: str) -> None:
+    old_message_id = reply_state.message_id
+    new_message_id = _create_lark_md_card_message(
+        reply_state.chat_id,
+        text,
+        f"{old_message_id}-card-fallback",
+    )
+    reply_state.message_id = new_message_id
+    reply_state.mode = "final_card"
+    reply_state.card_id = ""
+    try:
+        _delete_message(old_message_id)
+    except Exception as exc:
+        lark.logger.warning("delete old reply after lark_md card replacement failed: message_id=%s err=%s", old_message_id, exc)
+
+
 def _reply_stream_message(message: Any, text: str, uuid_suffix: str) -> ReplyMessageState:
     try:
         card_id = _create_partial_card_message()
@@ -1123,7 +1197,10 @@ def _update_reply_message(reply_state: ReplyMessageState, text: str, streaming_m
                 exc,
                 exc_info=True,
             )
-            _switch_reply_to_text(reply_state, text)
+            if streaming_mode:
+                _switch_reply_to_text(reply_state, text)
+            else:
+                _replace_reply_with_lark_md_card(reply_state, text)
             return
 
     _update_text_message(reply_state.message_id, text)
@@ -1290,21 +1367,21 @@ def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
         error_text = _format_error_message("消息解析失败", str(exc))
         if reaction_error:
             error_text += f"\n[提示] 表情回复失败: {_trim_text(reaction_error, 300)}"
-        _reply_text(message, error_text, "parse-error")
+        _reply_user_message(message, error_text, "parse-error")
         return
 
     if message.message_type != "text":
         text = _format_error_message("暂不支持该消息类型", f"message_type={message.message_type}")
         if reaction_error:
             text += f"\n[提示] 表情回复失败: {_trim_text(reaction_error, 300)}"
-        _reply_text(message, text, "unsupported")
+        _reply_user_message(message, text, "unsupported")
         return
 
     if not query:
         text = _format_error_message("消息内容为空", "未转发到 Dify")
         if reaction_error:
             text += f"\n[提示] 表情回复失败: {_trim_text(reaction_error, 300)}"
-        _reply_text(message, text, "empty")
+        _reply_user_message(message, text, "empty")
         return
 
     reply_state = _reply_stream_message(message, FEISHU_PLACEHOLDER_TEXT, "placeholder")
