@@ -236,14 +236,15 @@ class FeishuStreamSender:
                 self._last_error = exc
 
     def _send_or_update_message(self, text: str) -> None:
+        if self.reply_state.mode == "final_card":
+            _patch_lark_md_card_message(self.reply_state.message_id, text)
+            return
+
         if self.reply_state.mode == "card":
             if not self.reply_state.card_id:
                 _create_additional_partial_card_message(self.reply_state)
             _update_partial_card_text(self.reply_state.card_id, text, self.reply_state.sequence)
             self.reply_state.sequence += 1
-            return
-
-        if self.reply_state.mode == "final_card":
             return
 
         _update_text_message(self.reply_state.message_id, text)
@@ -1203,21 +1204,6 @@ def _replace_reply_with_lark_md_card(reply_state: ReplyMessageState, text: str) 
 
 
 def _reply_stream_message(message: Any, text: str, uuid_suffix: str) -> ReplyMessageState:
-    try:
-        card_id = _create_partial_card_message()
-        if not card_id:
-            raise FeishuRequestError("create partial card succeeded but card_id is empty")
-        message_id = _reply_card_id_message(message, card_id, uuid_suffix)
-        return ReplyMessageState(
-            message_id=message_id,
-            chat_id=message.chat_id,
-            mode="card",
-            card_id=card_id,
-            sequence=1,
-        )
-    except Exception as exc:
-        lark.logger.warning("reply partial card message failed, fallback to final lark_md card mode: %s", exc, exc_info=True)
-
     message_id = _reply_lark_md_card(message, text, f"{uuid_suffix}-final-card")
     return ReplyMessageState(message_id=message_id, chat_id=message.chat_id, mode="final_card")
 
