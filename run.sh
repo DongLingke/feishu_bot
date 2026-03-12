@@ -3,6 +3,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MAIN_FILE="$PROJECT_DIR/main.py"
 LOG_FILE="$PROJECT_DIR/output.log"
 PID_FILE="$PROJECT_DIR/run.pid"
 
@@ -13,6 +14,21 @@ fi
 
 declare -a PIDS=()
 
+is_project_main_pid() {
+    local pid="$1"
+    local cmdline_file="/proc/$pid/cmdline"
+
+    [[ -r "$cmdline_file" ]] || return 1
+
+    while IFS= read -r arg; do
+        if [[ "$arg" == "$MAIN_FILE" ]]; then
+            return 0
+        fi
+    done < <(tr '\0' '\n' < "$cmdline_file")
+
+    return 1
+}
+
 if [[ -f "$PID_FILE" ]]; then
     saved_pid="$(tr -d '[:space:]' < "$PID_FILE")"
     if [[ "$saved_pid" =~ ^[0-9]+$ ]] && kill -0 "$saved_pid" 2>/dev/null; then
@@ -22,6 +38,7 @@ fi
 
 while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
+    is_project_main_pid "$pid" || continue
 
     duplicate="0"
     for existing_pid in "${PIDS[@]-}"; do
@@ -34,7 +51,7 @@ while IFS= read -r pid; do
     if [[ "$duplicate" == "0" ]]; then
         PIDS+=("$pid")
     fi
-done < <(pgrep -f "$PROJECT_DIR/main.py" || true)
+done < <(pgrep -f "main.py" || true)
 
 if [[ "${#PIDS[@]}" -gt 0 ]]; then
     echo "stopping existing process: ${PIDS[*]}"
