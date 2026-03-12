@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
 import queue
@@ -73,10 +74,24 @@ API_RETRY_TIMES = 3
 API_RETRY_BASE_SECONDS = 1.0
 MAX_ERROR_BODY_CHARS = 1500
 PREFERRED_OUTPUT_KEYS = ("answer", "text", "output", "result", "final_text")
+MESSAGE_WORKER_COUNT = 8
 
 PROCESSED_MESSAGES: "OrderedDict[str, float]" = OrderedDict()
 PROCESSED_MESSAGES_LOCK = threading.Lock()
 LOCAL_MOCK_PROCESS: subprocess.Popen[Any] | None = None
+MESSAGE_EXECUTOR = ThreadPoolExecutor(max_workers=MESSAGE_WORKER_COUNT, thread_name_prefix="message-worker")
+MESSAGE_FUTURES: set[Future[Any]] = set()
+MESSAGE_FUTURES_LOCK = threading.Lock()
+
+
+def _shutdown_message_executor() -> None:
+    try:
+        MESSAGE_EXECUTOR.shutdown(wait=False)
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_message_executor)
 
 
 class BotRuntimeError(Exception):
@@ -1365,28 +1380,40 @@ def _stream_dify_to_message(
         raise
 
 
-def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
-    message = data.event.message
-    message_id = message.message_id or ""
-    create_time_ms = None
+def _on_message_task_done(future: Future[Any]) -> None:
+    with MESSAGE_FUTURES_LOCK:
+        MESSAGE_FUTURES.discard(future)
+        remaining = len(MESSAGE_FUTURES)
+
     try:
-        create_time_ms = int(message.create_time)
-    except (TypeError, ValueError):
-        create_time_ms = None
+        future.result()
+    except Exception as exc:
+        lark.logger.error("background message task failed: %s", exc, exc_info=True)
+    else:
+        lark.logger.info("background message task finished: remaining=%s", remaining)
 
-    lark.logger.info(
-        "receive message: message_id=%s chat_id=%s type=%s",
-        message_id,
-        message.chat_id,
-        message.message_type,
-    )
 
-    if not message_id or _should_skip_message(message_id, create_time_ms):
+def _submit_message_task(data: P2ImMessageReceiveV1) -> None:
+    try:
+        future = MESSAGE_EXECUTOR.submit(_handle_received_message, data)
+    except RuntimeError:
+        lark.logger.warning("message executor unavailable, fallback to synchronous handling")
+        _handle_received_message(data)
         return
 
+    with MESSAGE_FUTURES_LOCK:
+        MESSAGE_FUTURES.add(future)
+        active_count = len(MESSAGE_FUTURES)
+
+    future.add_done_callback(_on_message_task_done)
+    lark.logger.info("message task submitted: active=%s max_workers=%s", active_count, MESSAGE_WORKER_COUNT)
+
+
+def _handle_received_message(data: P2ImMessageReceiveV1) -> None:
+    message = data.event.message
     reaction_error = ""
     try:
-        _add_ack_reaction(message_id)
+        _add_ack_reaction(message.message_id or "")
     except Exception as exc:
         reaction_error = str(exc)
         lark.logger.error("ack reaction failed: %s", reaction_error, exc_info=True)
@@ -1439,6 +1466,28 @@ def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
         if reaction_error:
             error_text += f"\n[提示] 表情回复失败: {_trim_text(reaction_error, 300)}"
         _update_reply_message(reply_state, error_text, streaming_mode=False)
+
+
+def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
+    message = data.event.message
+    message_id = message.message_id or ""
+    create_time_ms = None
+    try:
+        create_time_ms = int(message.create_time)
+    except (TypeError, ValueError):
+        create_time_ms = None
+
+    lark.logger.info(
+        "receive message: message_id=%s chat_id=%s type=%s",
+        message_id,
+        message.chat_id,
+        message.message_type,
+    )
+
+    if not message_id or _should_skip_message(message_id, create_time_ms):
+        return
+
+    _submit_message_task(data)
 
 
 def do_p2_im_message_reaction_created_v1(data: P2ImMessageReactionCreatedV1) -> None:
