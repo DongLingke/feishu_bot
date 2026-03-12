@@ -1,8 +1,8 @@
 """项目运行配置。
 
 公开仓库中的配置读取逻辑统一放在这里：
-1. 优先读取系统环境变量。
-2. 如果当前目录存在 `.env`，则读取 `.env` 中的值。
+1. 优先读取当前目录下的 `.env`。
+2. 如果 `.env` 没有对应字段，再读取系统环境变量。
 3. 如果都没有，则使用公开占位值。
 
 真实的私有配置应该只保留在 `.env` 中，不要直接写进仓库文件。
@@ -38,7 +38,7 @@ _DOTENV = _load_dotenv()
 
 
 def _env(name: str, default: str) -> str:
-    return os.getenv(name, _DOTENV.get(name, default))
+    return _DOTENV.get(name, os.getenv(name, default))
 
 
 def _env_int(name: str, default: int) -> int:
