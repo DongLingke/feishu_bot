@@ -49,7 +49,6 @@ except ImportError:  # pragma: no cover - Windows fallback
 TEXT_MENTION_PATTERN = re.compile(r"@_user_\d+\s*")
 FEISHU_REPLY_IN_THREAD = False
 FEISHU_ACK_REACTION_EMOJI_TYPE = "DONE"
-FEISHU_PLACEHOLDER_TEXT = "正在处理中，请稍候..."
 FEISHU_EMPTY_RESULT_TEXT = "工作流已结束，但没有返回可展示的文本结果。"
 FEISHU_MAX_MESSAGE_CHARS = 28000
 FEISHU_CARD_MESSAGE_TYPE = "interactive"
@@ -473,11 +472,6 @@ def _patch_lark_md_card_message(message_id: str, text: str) -> None:
     _retry_lark_call("patch lark_md card message", _patch)
 
 
-def _reply_stream_message(message: Any, text: str) -> ReplyMessageState:
-    message_id = _reply_lark_md_card(message, text)
-    return ReplyMessageState(message_id=message_id)
-
-
 def _update_reply_message(reply_state: ReplyMessageState, text: str) -> None:
     _patch_lark_md_card_message(reply_state.message_id, text)
 
@@ -504,7 +498,8 @@ def _add_ack_reaction(message_id: str) -> None:
 
 
 def _stream_dify_to_message(
-    reply_state: ReplyMessageState,
+    message: Any,
+    reply_state_holder: dict[str, ReplyMessageState],
     query: str,
     user_identifier: str,
     session_key: str,
@@ -513,9 +508,20 @@ def _stream_dify_to_message(
     app_type = str(config.DIFY_APP_TYPE or "workflow").strip().lower()
     accumulated_text = ""
     stream_finished = False
-    stream_sender = FeishuStreamSender(reply_state)
-    stream_sender.start()
+    stream_sender: FeishuStreamSender | None = None
     current_conversation_id = _get_conversation_id(session_key) if app_type == "chat" else ""
+
+    def ensure_reply_state(initial_text: str) -> ReplyMessageState:
+        nonlocal stream_sender
+        reply_state = reply_state_holder.get("state")
+        if reply_state is not None:
+            return reply_state
+
+        reply_state = ReplyMessageState(message_id=_reply_lark_md_card(message, initial_text))
+        reply_state_holder["state"] = reply_state
+        stream_sender = FeishuStreamSender(reply_state)
+        stream_sender.start()
+        return reply_state
 
     try:
         upstream_request = UpstreamRequest(
@@ -544,6 +550,7 @@ def _stream_dify_to_message(
                     accumulated_text = chunk_text
                 else:
                     accumulated_text += chunk_text
+                reply_state = ensure_reply_state(accumulated_text)
                 lark.logger.info(
                     "stream chunk received: reply_message_id=%s chunk_len=%s total_len=%s replace=%s",
                     reply_state.message_id,
@@ -551,7 +558,8 @@ def _stream_dify_to_message(
                     len(accumulated_text),
                     replace_text,
                 )
-                stream_sender.add(accumulated_text)
+                if stream_sender is not None:
+                    stream_sender.add(accumulated_text)
                 continue
 
             if upstream_event.finished:
@@ -567,9 +575,16 @@ def _stream_dify_to_message(
                 if extra_notice:
                     final_text = f"{final_text}\n\n[提示] {extra_notice}"
 
-                stream_sender.finish(final_text)
-                stream_sender.close()
-                stream_sender.wait()
+                reply_state = reply_state_holder.get("state")
+                if reply_state is None:
+                    reply_state = ensure_reply_state(final_text)
+                if stream_sender is not None:
+                    stream_sender.finish(final_text)
+                    stream_sender.close()
+                    stream_sender.wait()
+                    updates = stream_sender.sent_update_count
+                else:
+                    updates = 0
 
                 lark.logger.info(
                     "dify stream finished: app_type=%s reply_message_id=%s event=%s status=%s total_len=%s updates=%s",
@@ -578,7 +593,7 @@ def _stream_dify_to_message(
                     event_name,
                     upstream_event.finish_status,
                     len(final_text),
-                    stream_sender.sent_update_count,
+                    updates,
                 )
                 break
 
@@ -586,16 +601,18 @@ def _stream_dify_to_message(
                 lark.logger.warning("unknown upstream event: %s", upstream_event.raw_event or event_name)
 
         if not stream_finished:
-            stream_sender.close()
-            stream_sender.wait(raise_on_error=False)
+            if stream_sender is not None:
+                stream_sender.close()
+                stream_sender.wait(raise_on_error=False)
             raise DifyRequestError(
                 "Dify stream closed unexpectedly",
                 "stream ended before final event",
             )
     except Exception:
         if not stream_finished:
-            stream_sender.close()
-            stream_sender.wait(raise_on_error=False)
+            if stream_sender is not None:
+                stream_sender.close()
+                stream_sender.wait(raise_on_error=False)
         raise
 
 
@@ -673,13 +690,12 @@ def _handle_received_message(data: P2ImMessageReceiveV1) -> None:
         _reply_lark_md_card(message, reset_text)
         return
 
-    reply_state = _reply_stream_message(message, FEISHU_PLACEHOLDER_TEXT)
-    if not reply_state.message_id:
-        raise FeishuRequestError("placeholder message created but message_id is empty")
+    reply_state_holder: dict[str, ReplyMessageState] = {}
 
     try:
         _stream_dify_to_message(
-            reply_state,
+            message,
+            reply_state_holder,
             query,
             user_identifier,
             session_key,
@@ -690,13 +706,21 @@ def _handle_received_message(data: P2ImMessageReceiveV1) -> None:
         error_text = _format_error_message(exc.summary, exc.detail)
         if reaction_error:
             error_text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
-        _update_reply_message(reply_state, error_text)
+        reply_state = reply_state_holder.get("state")
+        if reply_state is None:
+            _reply_lark_md_card(message, error_text)
+        else:
+            _update_reply_message(reply_state, error_text)
     except Exception as exc:
         lark.logger.error("unexpected handler error: %s", exc, exc_info=True)
         error_text = _format_error_message("处理消息时发生未预期错误", str(exc))
         if reaction_error:
             error_text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
-        _update_reply_message(reply_state, error_text)
+        reply_state = reply_state_holder.get("state")
+        if reply_state is None:
+            _reply_lark_md_card(message, error_text)
+        else:
+            _update_reply_message(reply_state, error_text)
 
 
 def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
