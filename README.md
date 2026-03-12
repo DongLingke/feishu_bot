@@ -49,7 +49,7 @@
 3. 主程序把消息转换成统一的 `UpstreamRequest`
 4. 上游适配器负责把标准请求转换成目标后端需要的请求体
 5. 上游流式返回事件后，再统一转换成 `UpstreamStreamEvent`
-6. 主程序把增量内容持续 patch 到同一条飞书 Markdown 卡片
+6. 主程序通过 CardKit 流式更新卡片元素内容，并在结束时更新成最终 Markdown 卡片
 
 ## 快速开始
 
@@ -117,6 +117,8 @@ python3 main.py
 - `im:message`
 - `im:message:write`
 - `im:message:reaction`
+- `cardkit:card:write`
+- `cardkit:card:read`
 
 如果你使用的是企业内部应用，还需要在飞书后台把机器人加到对应群聊或可见范围中。
 

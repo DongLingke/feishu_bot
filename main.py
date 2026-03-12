@@ -10,12 +10,23 @@ import re
 import subprocess
 import threading
 import time
-import urllib.request
+import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import lark_oapi as lark
+from lark_oapi.api.cardkit.v1 import (
+    Card,
+    ContentCardElementRequest,
+    ContentCardElementRequestBody,
+    CreateCardRequest,
+    CreateCardRequestBody,
+    SettingsCardRequest,
+    SettingsCardRequestBody,
+    UpdateCardRequest,
+    UpdateCardRequestBody,
+)
 from lark_oapi.api.im.v1 import (
     CreateMessageReactionRequest,
     CreateMessageReactionRequestBody,
@@ -23,8 +34,6 @@ from lark_oapi.api.im.v1 import (
     P2ImMessageMessageReadV1,
     P2ImMessageReceiveV1,
     P2ImMessageReactionCreatedV1,
-    PatchMessageRequest,
-    PatchMessageRequestBody,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
@@ -32,6 +41,7 @@ from lark_oapi.api.im.v1 import (
 import config
 from feishu_bot.errors import BotRuntimeError, DifyRequestError, FeishuRequestError
 from feishu_bot.markdown_card import (
+    build_streaming_card_json,
     build_lark_md_card_json,
     prepare_streaming_preview_text,
     trim_message_text,
@@ -52,6 +62,8 @@ FEISHU_ACK_REACTION_EMOJI_TYPE = "DONE"
 FEISHU_EMPTY_RESULT_TEXT = "工作流已结束，但没有返回可展示的文本结果。"
 FEISHU_MAX_MESSAGE_CHARS = 28000
 FEISHU_CARD_MESSAGE_TYPE = "interactive"
+STREAMING_CARD_SUMMARY_TEXT = "回答中..."
+STREAMING_CARD_ELEMENT_ID = "streaming_content"
 
 MESSAGE_MAX_AGE_MS = 120000
 MESSAGE_CACHE_SIZE = 1000
@@ -145,6 +157,16 @@ atexit.register(_release_instance_lock)
 @dataclass
 class ReplyMessageState:
     message_id: str
+    card_id: str
+    element_id: str
+    operation_uuid_prefix: str = field(default_factory=lambda: uuid.uuid4().hex)
+    _sequence: int = 0
+    _sequence_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def next_sequence(self) -> int:
+        with self._sequence_lock:
+            self._sequence += 1
+            return self._sequence
 
 
 class FeishuStreamSender:
@@ -255,10 +277,10 @@ class FeishuStreamSender:
                 self._last_error = exc
 
     def _send_or_update_message(self, text: str) -> None:
-        _patch_lark_md_card_message(self.reply_state.message_id, text)
+        _cardkit_update_stream_content(self.reply_state, text)
 
     def _finish_message(self, text: str) -> None:
-        _patch_lark_md_card_message(self.reply_state.message_id, text)
+        _cardkit_finish_message(self.reply_state, text)
 
     def _get_safe_send_text(self, data: str) -> str:
         text = re.sub(r"(?m)^\s+(?=```)", "", data)
@@ -276,6 +298,22 @@ def _message_reply_uuid(message_id: str) -> str:
 
 def _json_lark_md_card_message(text: str) -> str:
     return build_lark_md_card_json(text, FEISHU_MAX_MESSAGE_CHARS)
+
+
+def _json_streaming_card_message(text: str, element_id: str) -> str:
+    return build_streaming_card_json(text, FEISHU_MAX_MESSAGE_CHARS, element_id, STREAMING_CARD_SUMMARY_TEXT)
+
+
+def _json_card_reference_message(card_id: str) -> str:
+    return json.dumps(
+        {
+            "type": "card",
+            "data": {
+                "card_id": card_id,
+            },
+        },
+        ensure_ascii=False,
+    )
 
 
 def _decode_bytes(value: Any) -> str:
@@ -499,27 +537,145 @@ def _reply_lark_md_card(message: Any, text: str) -> str:
     return _retry_lark_call("reply lark_md card message", _reply)
 
 
-def _patch_lark_md_card_message(message_id: str, text: str) -> None:
-    content = _json_lark_md_card_message(text)
+def _create_streaming_card(text: str, element_id: str) -> str:
+    content = _json_streaming_card_message(text, element_id)
 
-    def _patch() -> None:
-        response = client.im.v1.message.patch(
-            PatchMessageRequest.builder()
-            .message_id(message_id)
+    def _create() -> str:
+        response = client.cardkit.v1.card.create(
+            CreateCardRequest.builder()
             .request_body(
-                PatchMessageRequestBody.builder()
-                .content(content)
+                CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(content)
                 .build()
             )
             .build()
         )
-        _raise_for_lark_failure("patch lark_md card message", response)
+        _raise_for_lark_failure("create cardkit streaming card", response)
+        return getattr(response.data, "card_id", "") or ""
 
-    _retry_lark_call("patch lark_md card message", _patch)
+    return _retry_lark_call("create cardkit streaming card", _create)
+
+
+def _reply_cardkit_card(message: Any, card_id: str) -> str:
+    content = _json_card_reference_message(card_id)
+    reply_uuid = _message_reply_uuid(message.message_id or "")
+
+    def _reply() -> str:
+        response = client.im.v1.message.reply(
+            ReplyMessageRequest.builder()
+            .message_id(message.message_id)
+            .request_body(
+                ReplyMessageRequestBody.builder()
+                .content(content)
+                .msg_type(FEISHU_CARD_MESSAGE_TYPE)
+                .reply_in_thread(FEISHU_REPLY_IN_THREAD)
+                .uuid(reply_uuid)
+                .build()
+            )
+            .build()
+        )
+        _raise_for_lark_failure("reply cardkit card message", response)
+        return getattr(response.data, "message_id", "") or ""
+
+    return _retry_lark_call("reply cardkit card message", _reply)
+
+
+def _reply_streaming_card_message(message: Any, text: str) -> ReplyMessageState:
+    card_id = _create_streaming_card(text, STREAMING_CARD_ELEMENT_ID)
+    message_id = _reply_cardkit_card(message, card_id)
+    lark.logger.info("created cardkit streaming card: card_id=%s reply_message_id=%s", card_id, message_id)
+    return ReplyMessageState(
+        message_id=message_id,
+        card_id=card_id,
+        element_id=STREAMING_CARD_ELEMENT_ID,
+    )
+
+
+def _cardkit_update_stream_content(reply_state: ReplyMessageState, text: str) -> None:
+    sequence = reply_state.next_sequence()
+    request_uuid = f"{reply_state.operation_uuid_prefix}-content-{sequence}"
+
+    def _update() -> None:
+        response = client.cardkit.v1.card_element.content(
+            ContentCardElementRequest.builder()
+            .card_id(reply_state.card_id)
+            .element_id(reply_state.element_id)
+            .request_body(
+                ContentCardElementRequestBody.builder()
+                .uuid(request_uuid)
+                .content(text)
+                .sequence(sequence)
+                .build()
+            )
+            .build()
+        )
+        _raise_for_lark_failure("update cardkit streaming content", response)
+
+    _retry_lark_call("update cardkit streaming content", _update)
+
+
+def _cardkit_set_streaming_mode(reply_state: ReplyMessageState, enabled: bool) -> None:
+    sequence = reply_state.next_sequence()
+    request_uuid = f"{reply_state.operation_uuid_prefix}-settings-{sequence}"
+    settings = json.dumps({"streaming_mode": enabled}, ensure_ascii=False)
+
+    def _settings() -> None:
+        response = client.cardkit.v1.card.settings(
+            SettingsCardRequest.builder()
+            .card_id(reply_state.card_id)
+            .request_body(
+                SettingsCardRequestBody.builder()
+                .uuid(request_uuid)
+                .settings(settings)
+                .sequence(sequence)
+                .build()
+            )
+            .build()
+        )
+        _raise_for_lark_failure("update cardkit settings", response)
+
+    _retry_lark_call("update cardkit settings", _settings)
+
+
+def _cardkit_update_final_card(reply_state: ReplyMessageState, text: str) -> None:
+    content = _json_lark_md_card_message(text)
+    sequence = reply_state.next_sequence()
+    request_uuid = f"{reply_state.operation_uuid_prefix}-final-{sequence}"
+
+    def _update() -> None:
+        response = client.cardkit.v1.card.update(
+            UpdateCardRequest.builder()
+            .card_id(reply_state.card_id)
+            .request_body(
+                UpdateCardRequestBody.builder()
+                .uuid(request_uuid)
+                .sequence(sequence)
+                .card(
+                    Card.builder()
+                    .type("card_json")
+                    .data(content)
+                    .build()
+                )
+                .build()
+            )
+            .build()
+        )
+        _raise_for_lark_failure("update final cardkit card", response)
+
+    _retry_lark_call("update final cardkit card", _update)
+
+
+def _cardkit_finish_message(reply_state: ReplyMessageState, text: str) -> None:
+    try:
+        _cardkit_set_streaming_mode(reply_state, False)
+    except Exception as exc:
+        lark.logger.warning("disable cardkit streaming mode failed: card_id=%s err=%s", reply_state.card_id, exc)
+    _cardkit_update_final_card(reply_state, text)
 
 
 def _update_reply_message(reply_state: ReplyMessageState, text: str) -> None:
-    _patch_lark_md_card_message(reply_state.message_id, text)
+    _cardkit_finish_message(reply_state, text)
 
 
 def _add_ack_reaction(message_id: str) -> None:
@@ -563,7 +719,8 @@ def _stream_dify_to_message(
         if reply_state is not None:
             return reply_state
 
-        reply_state = ReplyMessageState(message_id=_reply_lark_md_card(message, initial_text))
+        initial_text = prepare_streaming_preview_text(trim_message_text(initial_text, FEISHU_MAX_MESSAGE_CHARS))
+        reply_state = _reply_streaming_card_message(message, initial_text)
         reply_state_holder["state"] = reply_state
         stream_sender = FeishuStreamSender(reply_state)
         stream_sender.start()

@@ -159,3 +159,31 @@ def build_lark_md_card_json(text: str, max_chars: int) -> str:
         },
     }
     return json.dumps(card, ensure_ascii=False)
+
+
+def build_streaming_card_json(text: str, max_chars: int, element_id: str, summary: str = "回答中...") -> str:
+    """构造 CardKit 流式卡片实体。"""
+    final_text = trim_message_text(normalize_lark_md(text), max_chars)
+    card = {
+        "schema": "2.0",
+        "config": {
+            "width_mode": "fill",
+            "streaming_mode": True,
+            "summary": {
+                "content": summary,
+            },
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": final_text,
+                    "text_align": "left",
+                    "text_size": "normal_v2",
+                    "margin": "0px 0px 0px 0px",
+                    "element_id": element_id,
+                }
+            ]
+        },
+    }
+    return json.dumps(card, ensure_ascii=False)
