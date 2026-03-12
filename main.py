@@ -136,7 +136,6 @@ atexit.register(_release_instance_lock)
 @dataclass
 class ReplyMessageState:
     message_id: str
-    chat_id: str
 
 
 class FeishuStreamSender:
@@ -181,12 +180,6 @@ class FeishuStreamSender:
             return
         self._last_msg_content = text
         self._queue.put(self._FLUSH)
-
-    def cancel(self) -> None:
-        if self._stopped:
-            return
-        self._queue.put(self._STOP)
-        self._stopped = True
 
     def close(self) -> None:
         if self._stopped:
@@ -514,7 +507,7 @@ def _format_finished_status(data: dict[str, Any]) -> str:
     return ", ".join(pieces)
 
 
-def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
+def _reply_lark_md_card(message: Any, text: str) -> str:
     content = _json_lark_md_card_message(text)
     reply_uuid = _message_reply_uuid(message.message_id or "")
 
@@ -538,10 +531,6 @@ def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
     return _retry_lark_call("reply lark_md card message", _reply)
 
 
-def _reply_user_message(message: Any, text: str, uuid_suffix: str) -> str:
-    return _reply_lark_md_card(message, text, uuid_suffix)
-
-
 def _patch_lark_md_card_message(message_id: str, text: str) -> None:
     content = _json_lark_md_card_message(text)
 
@@ -561,12 +550,12 @@ def _patch_lark_md_card_message(message_id: str, text: str) -> None:
     _retry_lark_call("patch lark_md card message", _patch)
 
 
-def _reply_stream_message(message: Any, text: str, uuid_suffix: str) -> ReplyMessageState:
-    message_id = _reply_lark_md_card(message, text, f"{uuid_suffix}-final-card")
-    return ReplyMessageState(message_id=message_id, chat_id=message.chat_id)
+def _reply_stream_message(message: Any, text: str) -> ReplyMessageState:
+    message_id = _reply_lark_md_card(message, text)
+    return ReplyMessageState(message_id=message_id)
 
 
-def _update_reply_message(reply_state: ReplyMessageState, text: str, streaming_mode: bool) -> None:
+def _update_reply_message(reply_state: ReplyMessageState, text: str) -> None:
     _patch_lark_md_card_message(reply_state.message_id, text)
 
 
@@ -731,21 +720,21 @@ def _handle_received_message(data: P2ImMessageReceiveV1) -> None:
         error_text = _format_error_message("消息解析失败", str(exc))
         if reaction_error:
             error_text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
-        _reply_user_message(message, error_text, "parse-error")
+        _reply_lark_md_card(message, error_text)
         return
 
     if message.message_type != "text":
         text = _format_error_message("暂不支持该消息类型", f"message_type={message.message_type}")
         if reaction_error:
             text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
-        _reply_user_message(message, text, "unsupported")
+        _reply_lark_md_card(message, text)
         return
 
     if not query:
         text = _format_error_message("消息内容为空", "未转发到 Dify")
         if reaction_error:
             text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
-        _reply_user_message(message, text, "empty")
+        _reply_lark_md_card(message, text)
         return
 
     user_identifier = _sender_user_id(data)
@@ -758,10 +747,10 @@ def _handle_received_message(data: P2ImMessageReceiveV1) -> None:
             reset_text = "当前没有可清空的会话上下文。接下来我会从新的对话开始回答。"
         if reaction_error:
             reset_text += f"\n\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
-        _reply_user_message(message, reset_text, "reset-context")
+        _reply_lark_md_card(message, reset_text)
         return
 
-    reply_state = _reply_stream_message(message, FEISHU_PLACEHOLDER_TEXT, "placeholder")
+    reply_state = _reply_stream_message(message, FEISHU_PLACEHOLDER_TEXT)
     if not reply_state.message_id:
         raise FeishuRequestError("placeholder message created but message_id is empty")
 
@@ -778,13 +767,13 @@ def _handle_received_message(data: P2ImMessageReceiveV1) -> None:
         error_text = _format_error_message(exc.summary, exc.detail)
         if reaction_error:
             error_text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
-        _update_reply_message(reply_state, error_text, streaming_mode=False)
+        _update_reply_message(reply_state, error_text)
     except Exception as exc:
         lark.logger.error("unexpected handler error: %s", exc, exc_info=True)
         error_text = _format_error_message("处理消息时发生未预期错误", str(exc))
         if reaction_error:
             error_text += f"\n[提示] 表情回复失败: {trim_text(reaction_error, 300)}"
-        _update_reply_message(reply_state, error_text, streaming_mode=False)
+        _update_reply_message(reply_state, error_text)
 
 
 def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
