@@ -23,8 +23,6 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
     CreateMessageReactionRequest,
     CreateMessageReactionRequestBody,
-    CreateMessageRequest,
-    CreateMessageRequestBody,
     Emoji,
     P2ImMessageMessageReadV1,
     P2ImMessageReceiveV1,
@@ -74,6 +72,20 @@ MESSAGE_FUTURES: set[Future[Any]] = set()
 MESSAGE_FUTURES_LOCK = threading.Lock()
 INSTANCE_LOCK_FILE = os.path.join(os.path.dirname(__file__), "bot.lock")
 INSTANCE_LOCK_HANDLE: Any | None = None
+
+
+def _current_build_id() -> str:
+    try:
+        output = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(__file__),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        build_id = output.strip()
+        return build_id or "unknown"
+    except Exception:
+        return "unknown"
 
 
 def _shutdown_message_executor() -> None:
@@ -805,32 +817,7 @@ def _reply_lark_md_card(message: Any, text: str, uuid_suffix: str) -> str:
         _raise_for_lark_failure("reply lark_md card message", response)
         return getattr(response.data, "message_id", "") or ""
 
-    try:
-        return _retry_lark_call("reply lark_md card message", _reply)
-    except Exception as reply_error:
-        lark.logger.warning("reply lark_md card message failed, fallback to chat create: %s", reply_error, exc_info=True)
-
-    def _create() -> str:
-        response = client.im.v1.message.create(
-            CreateMessageRequest.builder()
-            .receive_id_type("chat_id")
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(message.chat_id)
-                .msg_type(FEISHU_CARD_MESSAGE_TYPE)
-                .content(content)
-                .uuid(reply_uuid)
-                .build()
-            )
-            .build()
-        )
-        _raise_for_lark_failure("create lark_md card message", response)
-        return getattr(response.data, "message_id", "") or ""
-
-    try:
-        return _retry_lark_call("create lark_md card message", _create)
-    except Exception as create_error:
-        raise FeishuRequestError(f"create lark_md card message failed: {create_error}") from create_error
+    return _retry_lark_call("reply lark_md card message", _reply)
 
 
 def _reply_user_message(message: Any, text: str, uuid_suffix: str) -> str:
@@ -1137,8 +1124,16 @@ ws_client = lark.ws.Client(
 def main() -> None:
     _acquire_instance_lock()
     _ensure_local_mock_running()
-    if config.TEST_CONFIG["feishu_app_id"] == config.ONLINE_CONFIG["feishu_app_id"]:
-        lark.logger.warning("TEST 和 ONLINE 当前共用了同一个飞书应用，多个环境同时运行时会重复消费同一条消息。")
+    if (
+        config.TEST_CONFIG["feishu_app_id"] == config.ONLINE_CONFIG["feishu_app_id"]
+        and config.TEST_CONFIG["feishu_app_secret"] == config.ONLINE_CONFIG["feishu_app_secret"]
+    ):
+        raise BotRuntimeError(
+            "TEST 和 ONLINE 不能共用同一个飞书应用。"
+            "请为测试环境和正式环境配置不同的 feishu_app_id / feishu_app_secret，"
+            "否则无法保证不会重复消费同一条消息。"
+        )
+    lark.logger.info("bot build id: %s", _current_build_id())
     lark.logger.info("starting Feishu bot with dify page %s", config.DIFY_APP_PAGE_URL)
     ws_client.start()
 
